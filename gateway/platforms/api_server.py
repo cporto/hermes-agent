@@ -136,6 +136,8 @@ from gateway.browser_control_broker import (
 
 from gateway.platforms._shared import coerce_port as _coerce_port
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
+from gateway.run_busy import GatewayBusySessionMixin as _BusySessionMixin
+_agent_has_active_subagents = _BusySessionMixin._agent_has_active_subagents
 
 
 logger = logging.getLogger(__name__)
@@ -3212,8 +3214,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 with suppress(Exception):
                     await task
             return
-        with suppress(Exception):
-            agent.interrupt(interrupt_message)
+        # Mirror the inbound-path guard (run_busy.py): don't interrupt a turn that is still
+        # driving active subagents just because the client's SSE stream dropped. The run is
+        # tracked in _active_run_agents and keeps running in the background, so it does not
+        # need a live client to listen. A genuine stop on a subagent-less turn still aborts.
+        if not _agent_has_active_subagents(agent):
+            with suppress(Exception):
+                agent.interrupt(interrupt_message)
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
