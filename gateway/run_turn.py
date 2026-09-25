@@ -3440,7 +3440,7 @@ class GatewayTurnMixin:
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
-        # Interrupted: discard the response ("Operation interrupted." is noise).
+        # Interrupted: discard the response ("The turn did not complete." is noise).
         if not result.get("interrupted"):
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
 

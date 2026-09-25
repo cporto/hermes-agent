@@ -472,7 +472,7 @@ describe('useComposerSubmit with a blocking prompt parked on the session', () =>
   // Typing cannot answer approval/sudo/secret prompts, so the busy submit must
   // route text to the QUEUE — a steer would sit undelivered behind the blocked
   // tool batch, and interrupting to force it through resolves the prompt empty
-  // and ends the turn as "Operation interrupted." with the message lost.
+  // and ends the turn as "The turn did not complete." with the message lost.
   afterEach(() => {
     cleanup()
     clearAllPrompts()

@@ -16,7 +16,7 @@
  * latency). Tearing down the renderer↔backend WebSocket at that moment is a
  * false kill: the gateway sees its client vanish mid-turn, the
  * `ws_orphan_reap` grace expires, and the running turn is interrupted into a
- * bare "Operation interrupted." placeholder — the exact #95327 report.
+ * bare "The turn did not complete." placeholder — the exact #95327 report.
  *
  * Policy
  * ──────
