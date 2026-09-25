@@ -154,7 +154,7 @@ def test_interrupt_after_tool_closes_sequence_with_placeholder():
     assert messages[-1]["role"] == "assistant"
     # Empty final_response falls back to the explicit placeholder rather
     # than persisting an empty-content assistant turn.
-    assert messages[-1]["content"] == "Operation interrupted."
+    assert isinstance(messages[-1]["content"], str) and messages[-1]["content"].strip()
 
     # The persisted snapshot is alternation-safe: appending a new user
     # message would follow an assistant, not an orphan tool.

@@ -866,7 +866,7 @@ def _run_sequential_tool_execution_middleware(
             if future.done() and not future.cancelled():
                 return future.result()
             interrupt_reason = getattr(agent, "_tool_interrupt_reason", None) or "interrupt requested"
-            message = f"[Tool execution cancelled — {function_name} was abandoned: {interrupt_reason}]"
+            message = f"[{function_name} was stopped before finishing: {interrupt_reason}]"
             logger.info(
                 "sequential tool %s abandoned due to %s (%.1fs elapsed)",
                 function_name, interrupt_reason, time.monotonic() - started,
@@ -1348,7 +1348,7 @@ def _unfinished_tool_result(agent, ref: _ToolCallRef, *, timed_out: bool, timeou
         outcome = dict(duration_ms=int((timeout_s or 0.0) * 1000), status="timeout", error_type="tool_timeout", error_message=function_result)
         tool_duration, effect_disposition = float(timeout_s or 0.0), "unknown"
     elif agent._interrupt_requested:
-        function_result = f"[Tool execution cancelled — {ref.name} was skipped due to user interrupt]"
+        function_result = f"[{ref.name} was interrupted and did not finish. It may not have taken effect, so check before retrying.]"
         outcome = dict(status="cancelled", error_type="keyboard_interrupt", error_message="Tool execution cancelled by user interrupt")
         tool_duration, effect_disposition = 0.0, None
     else:
@@ -1408,7 +1408,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         print(f"{agent.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
         _append_skipped_tool_results(
             agent, messages, tool_calls, effective_task_id,
-            content="[Tool execution cancelled — {name} was skipped due to user interrupt]",
+            content="[{name} was interrupted and did not finish. It may not have taken effect, so check before retrying.]",
             hook_error_type="user_interrupt",
             flush_stage="cancelled tool result",
             stop_on_flush_failure=False,
@@ -1603,7 +1603,7 @@ def _run_sequential_call(
             agent.interrupt("keyboard interrupt")
         _append_skipped_tool_results(
             agent, messages, remaining_calls, ref.task_id,
-            content="[Tool execution cancelled — {name} was skipped due to keyboard interrupt]",
+            content="[{name} was interrupted and did not finish. It may not have taken effect, so check before retrying.]",
         )
         raise
     except Exception as tool_error:
@@ -1669,7 +1669,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if not _skip_remaining_sequential(
                 agent, messages, tool_calls[i - 1:], effective_task_id,
                 notice="tool call(s)",
-                content="[Tool execution cancelled — {name} was skipped due to user interrupt]",
+                content="[{name} was interrupted and did not finish. It may not have taken effect, so check before retrying.]",
                 hook_error_type="user_interrupt",
                 hook_id=lambda tc: getattr(tc, "id", "") or "",
                 flush_stage="cancelled tool result",
