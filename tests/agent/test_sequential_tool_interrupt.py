@@ -92,7 +92,8 @@ def test_interrupt_abandons_noncooperative_tool(monkeypatch, fake_agent, _fast_p
     elapsed = time.monotonic() - t0
 
     assert isinstance(managed.result, _ToolCancelledResult)
-    assert "cancelled" in str(managed.result)
+    # humanized in 4e596d81ed: message names the aborted tool, not "cancelled"
+    assert "image_generate" in str(managed.result)
     # poll (0.05s) + interrupt delay (0.1s) + grace (3s) + slack — nowhere
     # near the 30s tool runtime.
     assert elapsed < 10.0
