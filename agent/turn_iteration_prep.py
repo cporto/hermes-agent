@@ -21,6 +21,22 @@ from agent.turn_context_compaction import _reanchor
 
 logger = logging.getLogger("agent.conversation_loop")
 
+_SSE_REAPER_INTERRUPT_MESSAGES = frozenset({"SSE client disconnected", "SSE task cancelled"})
+
+
+def _is_sse_reaper_interrupt(agent):
+    """True when the interrupt is an SSE transport reaper, not user intent to stop.
+
+    On the api_server/WebUI path, a provider mid-stream drop tears down the browser SSE
+    leg, and the api_server drains the session stream with
+    ``agent.interrupt("SSE client disconnected")`` / ``("SSE task cancelled")``. Those
+    messages mean "no client listening", NOT that the user wants the turn stopped — the
+    same transport event arms a text-continuation recovery elsewhere. A genuine user stop
+    carries the user's own text (or "/stop") and is unaffected by this check.
+    """
+    msg = getattr(agent, "_interrupt_message", None)
+    return isinstance(msg, str) and msg in _SSE_REAPER_INTERRUPT_MESSAGES
+
 ITERATION_BUDGET_WARNING_TEMPLATE = (
     "[SYSTEM NOTICE — iteration budget checkpoint] You have used {used} of {maximum} "
     "iterations. Checkpoint durable progress now, then continue the task; do not stop "
@@ -327,7 +343,7 @@ def begin_iteration(
     # Reset per-turn checkpoint dedup so each iteration can take one snapshot.
     agent._checkpoint_mgr.new_turn()
 
-    if agent._interrupt_requested:
+    if agent._interrupt_requested and not _is_sse_reaper_interrupt(agent):
         interrupted = True
         _turn_exit_reason = "interrupted_by_user"
         if not agent.quiet_mode:
@@ -410,7 +426,7 @@ def apply_retry_restarts(
         _retry.restart_with_redirected_messages = False
         return _verdict("continue")
 
-    if interrupted:
+    if interrupted and not (_is_sse_reaper_interrupt(agent) and (_retry.restart_with_length_continuation or _retry.restart_with_rebuilt_messages)):
         _turn_exit_reason = "interrupted_during_api_call"
         return _verdict("break")
 
