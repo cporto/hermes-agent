@@ -63,6 +63,7 @@ def _attach_child(parent_agent: Any, child: Any) -> None:
     """Register the child for parent interrupt propagation."""
     if hasattr(parent_agent, "_active_children"):
         _with_children_lock(parent_agent, "append", child)
+    parent_agent._delegate_spawning = False
 
 def _detach_child(parent_agent: Any, child: Any) -> None:
     """Remove the child from parent interrupt propagation (no-op if absent)."""

@@ -179,6 +179,11 @@ def _build_child_agent(
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
+    # Close the interrupt race: mark the parent as spawning a child BEFORE any construction
+    # work so _agent_has_active_subagents() (which gates interrupt->queue demotion) sees
+    # mid-spawn work and won't hard-interrupt it. Cleared when the child is attached
+    # (delegate_tool_child_run._attach_child).
+    parent_agent._delegate_spawning = True
     import uuid as _uuid
     from run_agent import AIAgent
     from agent.delegation_context import delegated_child_context
