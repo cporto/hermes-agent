@@ -1765,6 +1765,18 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider)
         return True
+
+    # Per-source fallback policy (Claude Code review): a cron-sourced turn (no human to
+    # notice a 3am fallback) must not cascade onto the local/interactive tier. An entry
+    # marked 'interactive_only: true' is that tier; refuse it for cron runs.
+    if (
+        getattr(agent, "platform", "") == "cron"
+        and bool(fb.get("interactive_only"))
+    ):
+        logger.warning(
+            "Fallback skip: entry %s/%s is interactive_only; refusing local fallback for cron run",
+            fb_provider, fb_model)
+        return True
     return False
 
 
