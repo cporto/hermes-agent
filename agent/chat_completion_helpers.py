@@ -1736,6 +1736,22 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         unavailable.add(fb_key)
         logger.warning("Fallback skip: %s/%s is not locally usable (%s); suppressing for this session", fb_provider, fb_model, local_skip_reason)
         return True
+    # Capability-aware admission: a fallback entry may declare a max_prefill_tokens ceiling
+    # (e.g. a 16GB local model that can only prefill ~24k tokens). Skip it when the in-flight
+    # request's prompt exceeds that ceiling instead of attempting prefill and hitting the
+    # memory guard / OOM (Claude Code review, 2026-09-25).
+    max_prefill = fb.get("max_prefill_tokens")
+    try:
+        max_prefill = int(max_prefill) if max_prefill not in (None, "") else None
+    except (TypeError, ValueError):
+        max_prefill = None
+    if max_prefill and max_prefill > 0:
+        req_tokens = getattr(agent, "_last_prompt_size_tokens", None)
+        if req_tokens and req_tokens > max_prefill:
+            logger.warning(
+                "Fallback skip: entry %s/%s declares max_prefill_tokens=%s but request is %s tokens",
+                fb_provider, fb_model, max_prefill, req_tokens)
+            return True
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
     # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
