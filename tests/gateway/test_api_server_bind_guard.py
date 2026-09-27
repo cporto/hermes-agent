@@ -126,6 +126,62 @@ class TestBindMechanics:
             return s.getsockname()[1]
 
     @pytest.mark.asyncio
+    async def test_real_timewait_rebind_after_disconnect(self):
+        """A restarted adapter rebinds instantly even while the prior incarnation's
+        accepted-connection socket is still in TIME_WAIT on the same port.
+
+        The previous implementation disabled SO_REUSEADDR on macOS (``reuse_address=False``
+        on darwin), so a clean ``--replace`` restart — where the old server actively closed
+        an SSE connection and its accepted socket lingers in TIME_WAIT for ~60s — failed its
+        fresh bind with EADDRINUSE, which the code classified as a permanent config error and
+        dropped the api_server (and Mercury) until manual /platform resume.
+
+        This test reproduces the real mechanism: it seeds a TIME_WAIT socket on the port
+        (the old code path blocks the rebind and the bug is caught), then asserts the
+        adapter rebinds immediately (the fix).
+        """
+        port = self._free_port()
+
+        # Seed a TIME_WAIT socket on this port the way a real server connection leaves one:
+        # raw listen socket, accept a real client connection, then have the SERVER close its
+        # accepted socket first so *it* (sharing the port) enters TIME_WAIT (~60s on macOS).
+        lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        lsock.bind(("127.0.0.1", port))
+        lsock.listen(5)
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.settimeout(2)
+        client.connect(("127.0.0.1", port))
+        conn, _ = lsock.accept()
+        # server-initiated close: accepted socket -> TIME_WAIT on (127.0.0.1, port)
+        conn.close()
+        lsock.close()
+        client.close()
+
+        # Sanity: without SO_REUSEADDR the rebind is now blocked (proves TIME_WAIT is real).
+        blocking = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocking.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        blocked = False
+        try:
+            blocking.bind(("127.0.0.1", port))
+        except OSError as e:
+            blocked = e.errno == 48  # EADDRINUSE
+        finally:
+            blocking.close()
+        assert blocked, (
+            "test precondition failed: no TIME_WAIT socket seeded — "
+            "the test would not discriminate the bug"
+        )
+
+        # The fix: the restarted adapter uses SO_REUSEADDR (framework default) and binds
+        # immediately past the lingering TIME_WAIT socket.
+        adapter = self._make_adapter(port)
+        try:
+            assert await adapter.connect() is True
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
     async def test_immediate_rebind_after_disconnect(self):
         """A restarted adapter can rebind the same port immediately.
 

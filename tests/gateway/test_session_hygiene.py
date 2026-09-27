@@ -1348,6 +1348,73 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     return runner, adapter, event
 
 
+def test_hygiene_default_total_ceiling_is_responsive():
+    """The gateway default must bound progress-producing compression.
+
+    Behavioral invariant (not a source read): the default config binds a finite,
+    positive ``compression.hygiene_total_ceiling_seconds`` so a trickle-progress
+    compression worker cannot hold a gateway turn indefinitely. Read via the real
+    config chain; no frozen-number snapshot (that would be a change-detector).
+    """
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    compression = DEFAULT_CONFIG.get("compression", {})
+    assert isinstance(compression, dict)
+    ceiling = compression.get("hygiene_total_ceiling_seconds")
+    assert isinstance(ceiling, (int, float))
+    assert ceiling > 0
+
+
+@pytest.mark.asyncio
+async def test_progressing_hygiene_worker_hits_wall_clock_ceiling(monkeypatch, tmp_path):
+    """A trickle-progress worker must not hold a gateway turn indefinitely."""
+    release = threading.Event()
+    started = threading.Event()
+
+    class TrickleCompressAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "sess-progress")
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+                _last_summary_error=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+            type(self).last_instance = self
+
+        def _compress_context(self, messages, *_args, commit_fence=None, **_kwargs):
+            started.set()
+            while not release.is_set():
+                if commit_fence is not None:
+                    commit_fence.touch_progress()
+                time.sleep(0.01)
+            return messages, None
+
+    cfg = (
+        "compression:\n"
+        "  enabled: true\n"
+        "  hygiene_timeout_seconds: 0.02\n"
+        "  hygiene_total_ceiling_seconds: 0.08\n"
+    )
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch, tmp_path, TrickleCompressAgent, cfg
+    )
+
+    started_at = time.monotonic()
+    result = await runner._handle_message(event)
+    elapsed = time.monotonic() - started_at
+    release.set()
+
+    assert result == "ok"
+    assert started.wait(timeout=1)
+    assert elapsed < 0.5
+    assert runner.session_store.rewrite_transcript.call_count == 0
 
 
 # ---------------------------------------------------------------------------

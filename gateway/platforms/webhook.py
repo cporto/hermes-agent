@@ -214,11 +214,11 @@ class WebhookAdapter(BasePlatformAdapter):
         app.router.add_post("/p/{profile}/webhooks/{route_name}", self._handle_webhook)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
-        # SO_REUSEADDR: on macOS (BSD) two wildcard/specific sockets can silently split traffic while
-        # both report success → disable. On Linux it only permits rebinding past TIME_WAIT (a quick
-        # restart would otherwise fail to bind for ~60s) → keep the default.
-        site = web.TCPSite(self._runner, self._host, self._port,
-                           reuse_address=False if sys.platform == "darwin" else None)
+        # Use the framework default for SO_REUSEADDR on every platform (verified on macOS: two LIVE
+        # wildcard listeners on the same addr:port still conflict with SO_REUSEADDR — coexistence
+        # needs SO_REUSEPORT, never set here). SO_REUSEADDR additionally permits rebinding past
+        # TIME_WAIT, so a clean restart rebinds instantly instead of failing EADDRINUSE.
+        site = web.TCPSite(self._runner, self._host, self._port)
         try:
             await site.start()
         except OSError as exc:

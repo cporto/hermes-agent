@@ -759,7 +759,7 @@ class ResponseStore:
 
 
 _CORS_HEADERS = {
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Session-Id"}
 _SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
@@ -1086,6 +1086,34 @@ def _run_route_delegate(name: str):
         return await getattr(_api_runs, name)(self, request, _api_server=sys.modules[__name__])
     _handler.__name__ = name
     return _handler
+
+
+_webui_sidecar_title_cache: dict = {}
+
+def _webui_sidecar_title(home, session_id):
+    """WebUI-owned title from <home>/webui/sessions/<sid>.json, else None (fails soft).
+
+    Path-traversal-guarded; mtime/size-cached so large sidecars aren't re-parsed on
+    every session-list call. Any error returns None so the gateway title is kept.
+    """
+    if not home or not session_id or any(c in session_id for c in "/\\.."):
+        return None
+    try:
+        from pathlib import Path
+        path = Path(home) / "webui" / "sessions" / f"{session_id}.json"
+        st = path.stat()
+        key = str(path)
+        cached = _webui_sidecar_title_cache.get(key)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        title = data.get("title")
+        title = title.strip() if isinstance(title, str) and title.strip() else None
+        _webui_sidecar_title_cache[key] = (st.st_mtime_ns, st.st_size, title)
+        return title
+    except Exception:
+        return None
 
 
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
@@ -1516,9 +1544,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
-            ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
-            ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
-            ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
+            ('GET', '/api/sessions/{session_id}/messages', self._handle_session_messages),
+            ('POST', '/api/sessions/{session_id}/fork', self._handle_fork_session),
+            ('POST', '/api/sessions/{session_id}/rewind', self._handle_rewind_session),
+            ('POST', '/api/sessions/{session_id}/approval', self._handle_session_approval),
+            ('POST', '/api/sessions/{session_id}/chat', self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
@@ -2734,7 +2764,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
         # Archive visibility: defaults are unchanged (hide archived) so existing clients are
-        # unaffected. Explicitly request the list archived-only / include archived rows
+        # unaffected. Explicitly request them to list archived-only / include archived rows
         # (unblocks Mercury's reversible Archive). archived_only implies include.
         include_archived = _coerce_request_bool(request.query.get("include_archived"), default=False)
         archived_only = _coerce_request_bool(request.query.get("archived_only"), default=False)
@@ -2759,6 +2789,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return rows
 
         sessions = await _list()
+
+        # Overlay WebUI-sidecar titles so Mercury/PWA production matches the WebUI
+        # sidebar; fails soft to the gateway title when no sidecar/title exists.
+        try:
+            from hermes_constants import get_hermes_home
+        except Exception:
+            get_hermes_home = lambda: None  # noqa: E731 — fails soft
+        _home = get_hermes_home()
+        for _s in sessions:
+            _t = _webui_sidecar_title(_home, _s.get("id"))
+            if _t:
+                _s["title"] = _t
+
         if title_filter and not sessions:
             # A canonical Bot Chat auto-archived by the orphan reaper would make `hermes peer dm`
             # mint transient sessions: resurrect and re-list; deliberate archives stay put.
@@ -2854,6 +2897,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
+
+        # overlay for single session (WebUI-sidecar title), fails soft
+        try:
+            from hermes_constants import get_hermes_home
+        except Exception:
+            get_hermes_home = lambda: None  # noqa: E731
+        _t = _webui_sidecar_title(get_hermes_home(), session.get("id"))
+        if _t:
+            session["title"] = _t
+
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
     @_require_auth
@@ -2974,6 +3027,115 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response(str(exc), 400, code="invalid_title")
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+
+    @_require_auth
+    async def _handle_rewind_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/rewind — rewind-to-point for Edit.
+
+        Truncates the session's ACTIVE transcript to just BEFORE the given user
+        message (rewind-to-point), soft-archiving the dropped turns (the same
+        durable /undo /retry primitive via ``replace_messages(archive_dropped=True)``),
+        and returns that target message's text so the client can prefill an edit.
+
+        Body: ``{"message_id": int}`` — the numeric row ``id`` of the USER message
+        to rewind to (the same id the messages route returns). After this call the
+        session's live transcript ends right before that message; the caller sends
+        the (possibly edited) prompt as a normal chat/stream turn to continue from
+        there. Returns ``{rewound_count, target_message_id, target_text, new_head_id}``.
+        """
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        raw = body.get("message_id")
+        try:
+            target = int(raw)
+        except (TypeError, ValueError):
+            return _error_response("message_id must be an integer", 400, code="invalid_message_id")
+        if target <= 0:
+            return _error_response("message_id must be a positive integer", 400, code="invalid_message_id")
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return self._session_db_unavailable()
+        resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
+        try:
+            history = await asyncio.to_thread(
+                db.get_messages_as_conversation, resolved_id,
+                repair_alternation=True, include_row_ids=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("rewind: failed to load transcript for %s: %s", session_id, exc)
+            return _error_response("Could not load session transcript", 500, code="transcript_unavailable")
+        # Find the target user message by row id; keep everything strictly before it.
+        idx = None
+        target_text = ""
+        for i, m in enumerate(history):
+            if m.get("role") == "user" and m.get("_row_id") == target:
+                idx = i
+                raw_content = m.get("content")
+                target_text = raw_content if isinstance(raw_content, str) else ("" if raw_content is None else str(raw_content))
+                target_text = " ".join(target_text.split())
+                break
+        if idx is None:
+            return _error_response(
+                "No active user message with that id in this session", 404, code="rewind_target_not_found")
+        truncated = history[:idx]
+        try:
+            await asyncio.to_thread(
+                db.replace_messages, resolved_id, truncated,
+                archive_dropped=True, reject_active_turn_lease=True)
+        except Exception as exc:
+            logger.warning("rewind: replace failed for %s: %s", session_id, exc)
+            return _error_response("Rewind failed; transcript was not changed", 409, code="rewind_rejected")
+        # New head = the last kept active message's row id (newest row before the rewind point).
+        new_head_id = truncated[-1].get("_row_id") if truncated else None
+        return web.json_response({
+            "object": "rewind", "session_id": resolved_id,
+            "rewound_count": len(history) - idx, "target_message_id": target,
+            "target_text": target_text, "new_head_id": new_head_id})
+
+    @_require_auth
+    async def _handle_session_approval(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/approval — resolve a pending interactive approval.
+
+        Companion to the native session SSE's interactive-approval opt-in (Mercury's
+        approval card). The pending approval is keyed by the gateway session key (from
+        the ``X-Hermes-Session-Key`` header, falling back to the session id), NOT the
+        run_id. Body: ``{\"choice\": \"once\"|\"session\"|\"always\"|\"deny\", \"request_id\"?, \"reason\"?}``.
+        Returns the number of approvals resolved (0 if none pending)."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+        session_key = (gateway_session_key or "").strip() or session_id or ""
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        choice = body.get("choice") or body.get("decision")
+        if not isinstance(choice, str) or choice not in ("once", "session", "always", "deny", "approve", "reject"):
+            return _error_response(
+                "choice must be one of: once, session, always, deny, approve, reject",
+                400, code="invalid_approval_choice")
+        # Normalize the Mercury card's approve/reject verbs onto the gateway's choices.
+        choice_map = {"approve": "once", "reject": "deny"}
+        choice = choice_map.get(choice, choice)
+        request_id = body.get("request_id")
+        reason = body.get("reason")
+        try:
+            from tools.approval import resolve_gateway_approval
+            resolved = await asyncio.to_thread(
+                resolve_gateway_approval, session_key, choice,
+                resolve_all=body.get("resolve_all") is True,
+                reason=(reason if isinstance(reason, str) and reason else None),
+                request_id=(request_id if isinstance(request_id, str) and request_id else None))
+        except Exception as exc:
+            return _error_response(_redact_api_error_text(exc), 500, code="approval_resolve_failed")
+        return web.json_response({"object": "approval", "session_id": session_id, "resolved": resolved})
 
     async def _prepare_session_chat(self, request: "web.Request") -> tuple:
         """Shared prelude for /api/sessions/{id}/chat[/stream]: header/body validation, then
@@ -3131,8 +3293,61 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
                 events.enqueue(event_type, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
-        async def _run_and_signal() -> None:
+        # Interactive-approval opt-in (Mercury approval card): the client declares
+        # it wants dangerous commands surfaced as an approval.request on THIS stream
+        # instead of the silent unattended_mode deny. Read from the request body
+        # (interactive_approval: true) or the X-Hermes-Interactive-Approval header.
+        # Default OFF — a client that does not opt in keeps today's unattended policy.
+        _req_body = ctx.get("body") or {}
+        _interactive_approval = bool(
+            _req_body.get("interactive_approval") is True
+            or str(request.headers.get("X-Hermes-Interactive-Approval", "")).strip().lower() in ("1", "true", "yes"))
+
+        def _approval_notify(approval_data: dict) -> None:
+            """Bridge a gateway approval.request from the agent executor thread onto
+            this run's SSE, mirroring api_server_runs._make_approval_notify: redact the
+            flagged command, stamp choices, and thread-safely enqueue via
+            _SessionEventQueue.enqueue (which hops onto the owning loop from any thread)."""
             try:
+                _event = dict(approval_data or {})
+                if "command" in _event:
+                    from gateway.run import _redact_approval_command
+                    _event["command"] = _redact_approval_command(_event.get("command"))
+                _event["choices"] = _approval_event_choices(
+                    smart_denied=bool(_event.get("smart_denied")),
+                    allow_session=_event.get("allow_session") is not False,
+                    allow_permanent=_event.get("allow_permanent") is not False)
+                _event["run_id"] = run_id
+                _event["message_id"] = message_id
+                _event["request_id"] = _event.get("request_id") or approval_data.get("request_id")
+                events.enqueue("approval.request", _event)
+                self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=_event)
+            except Exception:
+                logger.exception("[api_server] approval-notify bridge failed")
+
+        async def _run_and_signal() -> None:
+            # Interactive-approval opt-in (Mercury approval card): when the client
+            # declared X-Hermes-Interactive-Approval, bind the opt-in CONTEXTVAR for
+            # this run's context. This makes _is_gateway_approval_context() return
+            # True for this api_server run even though api_server is normally in the
+            # unattended bucket (so dangerous commands prompt the human instead of the
+            # silent unattended_mode deny). Bind BEFORE run_conversation so the tool
+            # executor's approval gate sees it if it runs in this task's context; a
+            # worker-thread gate that can't see the contextvar is documented in HANDOFF
+            # as the residual risk (the notify below is the thread-safe delivery path).
+            _optin_token = None
+            _notify_key = None
+            try:
+                if _interactive_approval:
+                    from tools.approval_context import set_api_interactive_approval
+                    _optin_token = set_api_interactive_approval(True)
+                    try:
+                        from tools.approval import register_gateway_notify
+                        _notify_key = gateway_session_key or session_id or ""
+                        if _notify_key:
+                            register_gateway_notify(_notify_key, _approval_notify)
+                    except Exception:
+                        pass  # notify registration is best-effort; approve route still works
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
                     "runtime": runtime_meta}))
@@ -3174,6 +3389,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     run_id, "failed", error=_redact_api_error_text(exc), last_event="run.failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                # Unwrap the interactive-approval opt-in + notify so a concurrent
+                # run (or a later non-opted run) never inherits this context.
+                if _optin_token is not None:
+                    try:
+                        from tools.approval_context import reset_api_interactive_approval
+                        reset_api_interactive_approval(_optin_token)
+                    except Exception:
+                        pass
+                if _notify_key:
+                    try:
+                        from tools.approval import unregister_gateway_notify
+                        unregister_gateway_notify(_notify_key)
+                    except Exception:
+                        pass
                 self._active_run_agents.pop(run_id, None)
                 self._release_run_owner_if_forgotten(run_id)
                 await queue.put(_event_payload("done", {}))
@@ -3887,16 +4116,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
             # Bind directly (a pre-probe raced the bind, misreporting TIME_WAIT as "in use").
-            # SO_REUSEADDR off on macOS (BSD can split traffic between two listeners).
-            # Bind directly instead of probing 127.0.0.1 first — the old single-family pre-probe raced the
-            # real bind and reported a TIME_WAIT socket as "in use" (#10297), failing gateway restarts for
-            # up to ~60s. SO_REUSEADDR is platform-dependent (same rationale as the webhook adapter,
-            # #65482): - macOS (BSD semantics): two sockets with SO_REUSEADDR can silently split traffic
-            # while both report success — disable. - Linux: SO_REUSEADDR only permits rebinding past
-            # TIME_WAIT (a second live listener needs SO_REUSEPORT, never set), so keep the default
-            # (enabled) for instant restart rebinds.
+            # Use the framework default for SO_REUSEADDR on every platform (verified on macOS:
+            # two LIVE wildcard listeners on the same addr:port still conflict with SO_REUSEADDR —
+            # coexistence needs SO_REUSEPORT, never set here). SO_REUSEADDR only additionally
+            # permits rebinding past TIME_WAIT, so a clean `--replace` restart (where the prior
+            # incarnation's accepted-connection sockets linger in TIME_WAIT for ~60s) rebinds
+            # instantly instead of failing EADDRINUSE and permanently dropping the api_server.
             self._site = web.TCPSite(
-                self._runner, self._host, self._port, reuse_address=False if sys.platform == "darwin" else None)
+                self._runner, self._host, self._port)
             try:
                 await self._site.start()
             except OSError as exc:
@@ -3917,6 +4144,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         f"Port {self._port} already in use. Set "
                         f"platforms.api_server.port in config.yaml to a "
                         f"different value, then `/platform resume api_server`.",
+                        retryable=False)
+                else:
+                    # Any other bind OSError (EACCES, EADDRNOTAVAIL, EINVAL, ...) is likewise a
+                    # permanent misconfiguration, not a transient blip — routing it through a bare
+                    # ``return False`` would have the reconnect watcher retry forever and leak a
+                    # ResponseStore fd pair each time (the #52132 pattern). Fail fast, non-retryable.
+                    self._set_fatal_error(
+                        "api_server_bind_failed",
+                        f"Could not bind {self._host}:{self._port}: {exc}",
                         retryable=False)
                 logger.error(
                     "[%s] Could not bind %s:%d: %s. Set a different port in "

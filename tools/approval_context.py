@@ -50,6 +50,35 @@ def _is_interactive_cli() -> bool:
     return is_truthy_value(ctx_val) if ctx_val is not None else env_var_enabled("HERMES_INTERACTIVE")
 
 
+# Explicit interactive-approval opt-in for an api_server/gateway session that
+# advertises a human on the other end (Mercury's interactive approval card). By
+# default api_server is an UNATTENDED platform (no human, no /approve surface),
+# so dangerous commands resolve via approvals.unattended_mode (deny). A client
+# that opts in (per-request) escapes that bucket so the gateway-approval notify
+# branch emits an approval.request for the human to answer. The session env
+# (`_session_env("HERMES_GATEWAY_SESSION")`) is bound by the run executor.
+_api_interactive_approval_ctx: contextvars.ContextVar[str | None] = _ctx("api_interactive_approval", None)
+
+
+def set_api_interactive_approval(active: bool) -> contextvars.Token:
+    """Opt an api_server/gateway run into interactive gateway-approval. Per-context,
+    default OFF; returns a Token for reset. The run executor binds this in its own
+    thread context (concurrent api_server runs must not leak the flag across runs)."""
+    return _api_interactive_approval_ctx.set("1" if active else "")
+
+
+def reset_api_interactive_approval(token: contextvars.Token) -> None:
+    """Restore the prior value from :func:`set_api_interactive_approval`."""
+    _api_interactive_approval_ctx.reset(token)
+
+
+def _is_api_interactive_approval_opted_in() -> bool:
+    """True when the current context explicitly opted into interactive gateway
+    approval (the Mercury approval card), regardless of the unattended platform."""
+    ctx_val = _api_interactive_approval_ctx.get()
+    return is_truthy_value(ctx_val) if ctx_val is not None else False
+
+
 def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     """Invoke a plugin lifecycle hook (pre_approval_request / post_approval_response).
 
@@ -169,7 +198,17 @@ def _is_gateway_approval_context() -> bool:
     human who can resolve it (#37284, 87509). Their dangerous-command handling is governed by
     ``approvals.unattended_mode`` config (default deny), mirroring cron.
     """
-    if _is_cron_approval_context() or _is_unattended_platform_approval_context():
+    if _is_cron_approval_context():
+        return False
+    # An api_server/gateway session that EXPLICITLY opted into interactive approval
+    # (the Mercury approval card) escapes the unattended-platform exclusion — a
+    # human IS on the other end and can answer. Checked before the platform
+    # classification so the opted-in session reaches the gateway-approval notify
+    # branch (emits approval.request to the client). Without this, api_server stays
+    # in the unattended bucket and resolves via approvals.unattended_mode (deny).
+    if _is_api_interactive_approval_opted_in():
+        return True
+    if _is_unattended_platform_approval_context():
         return False
     return env_var_enabled("HERMES_GATEWAY_SESSION") or bool(_get_session_platform())
 
