@@ -2733,6 +2733,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
+        # Archive visibility: defaults are unchanged (hide archived) so existing clients are
+        # unaffected. Explicitly request the list archived-only / include archived rows
+        # (unblocks Mercury's reversible Archive). archived_only implies include.
+        include_archived = _coerce_request_bool(request.query.get("include_archived"), default=False)
+        archived_only = _coerce_request_bool(request.query.get("archived_only"), default=False)
+        if archived_only:
+            include_archived = True
         # Exact-title lookup (`hermes peer dm` -> canonical "Bot Chat"). include_hidden is honored
         # ONLY with a title filter: a blanket hidden listing stays off this client surface.
         title_filter = (request.query.get("title") or "").strip() or None
@@ -2745,7 +2752,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             rows = await asyncio.to_thread(
                 db.list_sessions_rich, source=source, limit=limit, offset=offset,
                 include_children=include_children, order_by_last_active=True, include_pinned=True,
-                search_query=title_filter, include_hidden=include_hidden)
+                search_query=title_filter, include_hidden=include_hidden,
+                include_archived=include_archived, archived_only=archived_only)
             if title_filter:
                 rows = [s for s in rows if (s.get("title") or "").strip() == title_filter]
             return rows
