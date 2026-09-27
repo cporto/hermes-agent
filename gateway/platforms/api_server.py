@@ -3367,6 +3367,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "content": final_response, "completed": True,
                     "partial": bool(result.get("partial")) if is_dict else False,
                     "interrupted": False, "runtime": effective_runtime}))
+                # Surface a "context was compressed" notice when this turn's transcript
+                # was compacted (mid-turn rotation or in-place compaction). result["_compressed"]
+                # is set authoritatively in _finish_turn_result. Transient event: Mercury renders
+                # it as a notice in this turn; existing clients ignore unknown event types.
+                if is_dict and result.get("_compressed"):
+                    try:
+                        await queue.put(_event_payload("notice", {
+                            "display_kind": "compression",
+                            "message_id": message_id,
+                            "notice": "Context was compressed to keep things fast."}))
+                    except Exception:
+                        logger.exception("[api_server] compression-notice emit failed")
                 # A steer accepted after the final reply lands in result["pending_steer"]; surface
                 # it so clients can replay it rather than lose it.
                 pending_steer = result.get("pending_steer") if is_dict else None
