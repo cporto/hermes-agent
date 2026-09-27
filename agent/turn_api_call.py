@@ -169,12 +169,29 @@ def handle_api_interrupt(
     queued for the outer-loop rebuild; otherwise keep any streamed partial text so the next
     turn has a record of the half-finished reply."""
     from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+    from agent.turn_iteration_prep import _is_sse_reaper_interrupt
 
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
     # redirect() cancelled only this request: keep the correction queued, clear the
     # cancellation bit, let the outer loop rebuild. Never materialize incomplete
     # signed/encrypted reasoning items.
     if agent._has_pending_redirect() and agent.clear_interrupt(preserve_redirect=True):
+        _retry.restart_with_redirected_messages = True
+        return ApiInterruptVerdict("break", thinking_spinner, interrupted, final_response)
+    if _is_sse_reaper_interrupt(agent) and not (
+        _retry.restart_with_length_continuation or _retry.restart_with_rebuilt_messages
+    ):
+        # SSE transport reaper ("SSE client disconnected" / "SSE task cancelled"):
+        # no client is listening, which is NOT user intent to stop. When the drop
+        # happened with no armed text-continuation/fallback recovery (e.g. a 0.0s
+        # drop before anything streamed), there is nothing to continue from — so
+        # instead of ending the turn with a fabricated "Operation interrupted:
+        # waiting for model response" dead-end, clear the transport-only interrupt
+        # and re-issue the same logical iteration. Mirrors the redirect recovery
+        # above: keeps ``interrupted`` False so the re-issued turn finalizes as a
+        # real response rather than an interrupted dead-end. A genuine user stop
+        # is never a reaper message, so it is unaffected by this branch.
+        agent.clear_interrupt()
         _retry.restart_with_redirected_messages = True
         return ApiInterruptVerdict("break", thinking_spinner, interrupted, final_response)
     api_elapsed = time.time() - api_start_time
