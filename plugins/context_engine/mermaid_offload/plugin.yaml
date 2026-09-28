@@ -1,0 +1,29 @@
+name: mermaid_offload
+description: >-
+  Offload/replace context engine. Moves large tool outputs to disk (per-session
+  store), replaces them in-context with compact placeholders and a Mermaid
+  flowchart canvas, and exposes offload_lookup / offload_search retrieval
+  tools. Mechanical (Sprint 1): pure Python, no LLM.
+version: 1.0.0
+author: Hermes Agent
+kind: context_engine
+
+# Config defaults — mirrored in config.py DEFAULT_CONFIG. Read from the
+# top-level `mermaid_offload:` section of config.yaml (context engines are
+# configured at top level, not under plugins:).
+config:
+  enabled: true
+  threshold: 0.50
+  aggressive_threshold: 0.85
+  emergency_threshold: 0.95
+  min_content_chars: 500
+  protect_first_n: 3
+  protect_last_n: 6
+  canvas_max_nodes: 40
+  canvas_max_chars: 2000
+  lookup_max_chars: 10000
+  retention_days: 14
+
+provides_tools:
+  - offload_lookup
+  - offload_search
