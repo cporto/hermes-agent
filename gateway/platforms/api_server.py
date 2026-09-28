@@ -1548,6 +1548,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ('POST', '/api/sessions/{session_id}/fork', self._handle_fork_session),
             ('POST', '/api/sessions/{session_id}/rewind', self._handle_rewind_session),
             ('POST', '/api/sessions/{session_id}/approval', self._handle_session_approval),
+            ('POST', '/api/sessions/{session_id}/clarify', self._handle_session_clarify),
             ('POST', '/api/sessions/{session_id}/chat', self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
@@ -2158,6 +2159,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        # The api_server surface ships its own interactive clarify bridge (Mercury's
+        # ClarifyCard) via `agent.clarify_callback` when a client opts in. Surface the
+        # clarify tool so that bridge is reachable - without the tool the model can never
+        # ask a clarifying question even when a bridge IS wired. Contained to this
+        # surface; it does not touch the user's global toolset config.
+        if "clarify" not in enabled_toolsets:
+            enabled_toolsets = sorted(set(enabled_toolsets) | {"clarify"})
         # Reasoning resolves against the model that actually runs (per-model overrides), so only
         # after the precedence chain settles; an explicit request wins.
         if request_reasoning_config is None:
@@ -3137,6 +3145,42 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response(_redact_api_error_text(exc), 500, code="approval_resolve_failed")
         return web.json_response({"object": "approval", "session_id": session_id, "resolved": resolved})
 
+    @_require_auth
+    async def _handle_session_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/clarify - resolve a pending interactive clarify.
+
+        Companion to the native session SSE's interactive-clarify opt-in (Mercury's
+        ClarifyCard). The pending clarify is keyed by the random ``clarify_id`` that the
+        SSE emitted on THIS session's stream (only the client that received it can know
+        it, so it is effectively session-scoped). Body: ``{"clarify_id": str,
+        "response": str}``. Fail-closed: returns 409 when no listener has a pending
+        clarify with that id (expired via timeout, cancelled by session teardown, or
+        already resolved)."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        clarify_id = body.get("clarify_id")
+        response = body.get("response")
+        if not isinstance(clarify_id, str) or not clarify_id.strip():
+            return _error_response("clarify_id must be a non-empty string", 400, code="invalid_clarify_id")
+        if not isinstance(response, str):
+            return _error_response("response must be a string", 400, code="invalid_clarify_response")
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+            resolved = await asyncio.to_thread(resolve_gateway_clarify, clarify_id, response)
+        except Exception as exc:
+            return _error_response(_redact_api_error_text(exc), 500, code="clarify_resolve_failed")
+        if not resolved:
+            return _error_response(
+                "No pending clarify with that id on this gateway (already resolved, "
+                "cancelled, or expired)", 409, code="clarify_not_found")
+        return web.json_response({"object": "clarify", "session_id": session_id,
+                                  "clarify_id": clarify_id, "resolved": True})
+
     async def _prepare_session_chat(self, request: "web.Request") -> tuple:
         """Shared prelude for /api/sessions/{id}/chat[/stream]: header/body validation, then
         runtime selection — a Browser model lock (body ``require_model_lock`` or a confirmed
@@ -3302,6 +3346,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         _interactive_approval = bool(
             _req_body.get("interactive_approval") is True
             or str(request.headers.get("X-Hermes-Interactive-Approval", "")).strip().lower() in ("1", "true", "yes"))
+        # Interactive-clarify opt-in (Mercury ClarifyCard): when the client declares it
+        # wants clarify questions surfaced on this stream (interactive_clarify: true or
+        # the X-Hermes-Interactive-Clarify header), wire the clarify tool's callback so a
+        # model clarify() ask becomes a clarify.request SSE event answered here instead of
+        # the tool erroring with _UNAVAILABLE (no callback). Default OFF - a client that
+        # does not opt in keeps today's behaviour (clarify tool present-but-unavailable).
+        _interactive_clarify = bool(
+            _req_body.get("interactive_clarify") is True
+            or str(request.headers.get("X-Hermes-Interactive-Clarify", "")).strip().lower() in ("1", "true", "yes"))
 
         def _approval_notify(approval_data: dict) -> None:
             """Bridge a gateway approval.request from the agent executor thread onto
@@ -3324,6 +3377,38 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=_event)
             except Exception:
                 logger.exception("[api_server] approval-notify bridge failed")
+
+        def _clarify_callback_sync(question, choices, multi_select: bool = False):
+            """Bridge a clarify tool call from the agent thread onto this run's SSE and
+            block for the user's answer (clarify_tool's synchronous contract - the agent
+            runs on a worker thread, so blocking here never stalls the event loop).
+
+            Mirrors gateway/run_turn_runner._clarify_callback_sync but routes the prompt
+            onto the NATIVE session SSE as a clarify.request event (so the Mercury
+            ClarifyCard surfaces it), resolved via POST /api/sessions/{id}/clarify. Uses
+            the gateway's merged tools.clarify_gateway primitive so the tool needs no
+            per-surface logic. Fail-closed: wait_for_response returns None after the
+            configured timeout if the client never resolves (agent falls back to its own
+            best judgement) and the entry is cleaned up on session teardown."""
+            from tools import clarify_gateway as clarify_mod
+            import uuid
+            clarify_id = uuid.uuid4().hex[:10]
+            choices_l = list(choices) if choices else None
+            session_key = (gateway_session_key or "").strip() or session_id or ""
+            clarify_mod.register(
+                clarify_id=clarify_id, session_key=session_key, question=str(question),
+                choices=choices_l, multi_select=bool(multi_select))
+            try:
+                events.enqueue("clarify.request", {
+                    "clarify_id": clarify_id, "question": str(question), "choices": choices_l,
+                    "multi_select": bool(multi_select), "run_id": run_id, "message_id": message_id})
+            except Exception:
+                logger.exception("[api_server] clarify.request emit failed")
+            try:
+                timeout = clarify_mod.get_clarify_timeout()
+            except Exception:
+                timeout = 3600
+            return clarify_mod.wait_for_response(clarify_id, timeout=timeout)
 
         async def _run_and_signal() -> None:
             # Interactive-approval opt-in (Mercury approval card): when the client
@@ -3356,7 +3441,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 history = await self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
                     conversation_history=history, stream_delta_callback=_delta,
-                    tool_progress_callback=_tool_progress, active_run_id=run_id, **ctx["run_kwargs"])
+                    tool_progress_callback=_tool_progress, active_run_id=run_id,
+                    clarify_callback=_clarify_callback_sync if _interactive_clarify else None,
+                    **ctx["run_kwargs"])
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
@@ -3877,7 +3964,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         requested_provider: Optional[str] = None, model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None, session_model: Optional[str] = None,
         requested_runtime: Optional[Dict[str, Any]] = None, route_source: str = "global",
-        confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False) -> tuple:
+        confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
+        clarify_callback=None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -3905,6 +3993,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                    # Wire the interactive clarify bridge if the request opted in. Runs on
+                    # the worker agent thread; clarify_tool hands this a (question/choices)
+                    # ask and blocks until the resident clears it (clarify_gateway Event).
+                    if clarify_callback is not None:
+                        agent.clarify_callback = clarify_callback
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:
