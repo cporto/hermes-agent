@@ -209,9 +209,13 @@ class InterruptControlMixin:
         if self._execution_thread_id is not None:
             _set_interrupt(False, self._execution_thread_id)
         _ic_signal_tool_workers(self, False)
-        # A hard interrupt supersedes any pending /steer — its target iteration will no longer happen.
-        with _ic_lock(self, "_pending_steer_lock"):
-            self._pending_steer = None
+        # Do NOT destroy a pending /steer here. The loop's post-turn finalize_turn
+        # (conversation_loop.py -> turn_finalizer.py) drains _pending_steer into
+        # result["pending_steer"] and surfaces it for replay, even on an interrupted
+        # turn. Nulling it here is what silently dropped an accepted-but-queued steer
+        # when the SSE client disconnected mid-plain-text-answer (Mercury issue: steers
+        # returned HTTP 200 but were lost). Leave it intact so the finalizer can carry
+        # it forward.
         return True
 
     def steer(self, text: str) -> bool:
