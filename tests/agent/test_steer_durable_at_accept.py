@@ -60,36 +60,35 @@ def _fake_db(tail_role):
     return _DB(), rows
 
 
-def test_accept_persist_writes_one_steer_row_when_tail_is_not_user():
+def _accept_persist_block(agent, db, nudge):
+    """Emulate the accept-time persist block from _handle_steer_run (persists
+    UNCONDITIONALLY — no tail-role gate), mirroring the real function's shape."""
     from agent.prompt_builder import steer_user_row
-    from agent.session_persistence import _db_flush_row  # canonical row projection
+    from agent.session_persistence import _db_flush_row, _persist_lock
+    with _persist_lock(agent):
+        row = steer_user_row(nudge)
+        db.append_messages_batch(agent.session_id,
+                                 messages=[_db_flush_row(agent, row, is_current_turn_user=False)])
+        agent._steer_durably_persisted = True
+
+
+def test_accept_persist_writes_one_steer_row_when_tail_is_not_user():
     db, rows = _fake_db("assistant")
     agent = _stub_agent("assistant", db)
-    # emulate the accept-time block from _handle_steer_run
-    from agent.session_persistence import _persist_lock
-    with _persist_lock(agent):
-        tail = db.get_messages(agent.session_id, limit=1, latest=True)
-        if tail and tail[-1].get("role") != "user":
-            row = steer_user_row("nudge-X")
-            db.append_messages_batch(agent.session_id,
-                                     messages=[_db_flush_row(agent, row, is_current_turn_user=False)])
-            agent._steer_durably_persisted = True
+    _accept_persist_block(agent, db, "nudge-X")
     steer_rows = [r for r in rows if r.get("display_kind") == "steer"]
     assert len(steer_rows) == 1
     assert "nudge-X" in steer_rows[0].get("content", "")
 
 
-def test_accept_persist_skips_user_tail_alternation():
-    from agent.prompt_builder import steer_user_row
-    from agent.session_persistence import _db_flush_row, _persist_lock
+def test_accept_persist_persists_on_user_tail_too():
+    # The normal steering window: the assistant is still streaming its reply (not yet
+    # saved), so the persisted tail is the user's own message. The durable write must
+    # NOT be skipped here — that is exactly when a no-guard persist saves the nudge on
+    # disconnect. The user;user wedge is healed at READ time by repair_alternation.
     db, rows = _fake_db("user")
     agent = _stub_agent("user", db)
-    with _persist_lock(agent):
-        tail = db.get_messages(agent.session_id, limit=1, latest=True)
-        if tail and tail[-1].get("role") != "user":
-            row = steer_user_row("nudge-X")
-            db.append_messages_batch(agent.session_id,
-                                     messages=[_db_flush_row(agent, row, is_current_turn_user=False)])
-            agent._steer_durably_persisted = True
+    _accept_persist_block(agent, db, "nudge-X")
     steer_rows = [r for r in rows if r.get("display_kind") == "steer"]
-    assert len(steer_rows) == 0  # no user->user row; deferred to drain
+    assert len(steer_rows) == 1  # exactly one, persisted even on a user tail
+    assert "nudge-X" in steer_rows[0].get("content", "")
