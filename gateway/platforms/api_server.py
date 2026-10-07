@@ -3924,6 +3924,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if requested_runtime:
             model, provider = self._requested_ids(requested_runtime)
             runtime["requested"] = {"provider": provider, "model": model}
+        # Context-usage for Mercury's header ring: forward the model's context
+        # window and the compressor threshold so the frontend can show
+        # used/window (% full) and when compression is imminent. Both come from
+        # the agent's context_compressor (context_length is the CURRENT model's
+        # window, threshold_tokens is where the agent compresses). Input/used is
+        # already carried via usage.input_tokens (session_prompt_tokens).
+        _cc = getattr(agent, "context_compressor", None) or None
+        runtime["context_window"] = getattr(_cc, "context_length", 0) or 0
+        runtime["compressor_threshold_tokens"] = getattr(_cc, "threshold_tokens", 0) or 0
         runtime["route_source"] = route_source or runtime.get("route_source") or "global"
         return self._sanitize_runtime_metadata(
             runtime=runtime, requested_runtime=requested_runtime or None, route_source=route_source or "global",
