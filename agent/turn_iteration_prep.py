@@ -252,7 +252,15 @@ def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
             from agent.prompt_builder import steer_user_row
-            messages.insert(_si + 1, steer_user_row(steer_text))
+            from agent.context_compressor import _DB_PERSISTED_MARKER
+            _row = steer_user_row(steer_text)
+            # The accept-time persist may have already written this steer durably as
+            # a display_kind=steer row; stamp the LIVE row so the next flush does NOT
+            # write a second durable copy (exactly one steer row in the transcript).
+            if getattr(agent, "_steer_durably_persisted", False):
+                _row[_DB_PERSISTED_MARKER] = True
+                setattr(agent, "_steer_durably_persisted", False)
+            messages.insert(_si + 1, _row)
             logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
             return
     from agent.agent_runtime_helpers import _requeue_pending_steer

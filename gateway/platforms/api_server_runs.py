@@ -794,6 +794,35 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
     if not accepted:
         return _json_error(
             _openai_error, f"Run did not accept steer text: {run_id}", code="steer_not_accepted", status=409)
+    # Persist the steer DURABLY at accept time (best-effort). agent.steer() above
+    # only QUEUED the text into _pending_steer; both later drain sites write the
+    # durable row only on a subsequent flush/finalize, which a hard interrupt
+    # (SSE disconnect) can skip — so an accepted steer was previously lost from
+    # the transcript on 'phone off + return'. Writing here survives any interrupt.
+    # Alt/dupe control: role alternation (never append role=user directly after a
+    # user tail); the agent-loop drain sites stamp _DB_PERSISTED_MARKER on the live
+    # row (and the finalizer skips) once this accept already made it durable, so
+    # the transcript gets EXACTLY ONE steer row. A failure here is non-fatal: the
+    # steer stays queued and the normal drain path still delivers/actions it.
+    try:
+        _db = getattr(agent, "_session_db", None)
+        if _db is not None:
+            from agent.prompt_builder import steer_user_row
+            from agent.session_persistence import _persist_lock, _db_flush_row
+            with _persist_lock(agent):
+                _tail = _db.get_messages(agent.session_id, limit=1, latest=True)
+                if not _tail or _tail[-1].get("role") != "user":
+                    _steer_row = steer_user_row(steer_text)
+                    _db.append_messages_batch(
+                        session_id=agent.session_id,
+                        messages=[_db_flush_row(agent, _steer_row, is_current_turn_user=False)],
+                        compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
+                        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                        turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+                    )
+                    setattr(agent, "_steer_durably_persisted", True)
+    except Exception:
+        logger.exception("[api_server] accept-time steer persist failed (best-effort)")
     _mark_run_event(self, run_id, "run.steered", accepted=True)
     return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
