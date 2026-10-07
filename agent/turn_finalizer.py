@@ -583,6 +583,20 @@ def finalize_turn(
     _leftover_steer = agent._drain_pending_steer()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
+        # Option-A durable persistence: ALSO write the steer as a display_kind=steer
+        # user row so it survives even if no live client replays `pending_steer`
+        # (e.g. the SSE client disconnected and never returns to replay — the case
+        # where Carlos's nudge was previously lost entirely). The row is the durable
+        # representation; a client that sees it persisted must not re-send it (dedupe
+        # on the replay side). Appending role=user steer after the shaped assistant
+        # tail keeps role alternation legal; steer_user_row is the canonical shape.
+        # Best-effort — a persist failure must never mask the turn result.
+        try:
+            from agent.prompt_builder import steer_user_row
+            messages.append(steer_user_row(_leftover_steer))
+            agent._persist_session(messages, conversation_history)
+        except Exception:
+            logger.exception("[finalize] failed to persist leftover steer durably")
     agent._response_was_previewed = False
     if interrupted and agent._interrupt_message:
         result["interrupt_message"] = agent._interrupt_message
