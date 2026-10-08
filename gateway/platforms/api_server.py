@@ -1931,6 +1931,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             result["requested"] = {"provider": provider, "model": model}
         if model_lock or payload.get("model_lock"):
             result["model_lock"] = cls._clean_runtime_id(model_lock or payload.get("model_lock"), max_len=32)
+        # Preserve the context-usage fields for Mercury's header ring (they'd
+        # otherwise be dropped by this whitelist).
+        for _k in ("context_window", "compressor_threshold_tokens"):
+            if isinstance(payload.get(_k), (int, float)) and payload[_k] > 0:
+                result[_k] = payload[_k]
         return result
 
     @staticmethod
