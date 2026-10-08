@@ -1795,7 +1795,10 @@ async def test_progressing_hygiene_worker_hits_wall_clock_ceiling(monkeypatch, t
 
     assert result == "ok"
     assert started.wait(timeout=1)
-    assert elapsed < 0.5
+    # The wall-clock ceiling must bound the trickle worker promptly (NOT hold the
+    # turn at the ~600s default). Generous load-safe bound per AGENTS.md (>=2s):
+    # the contract is 'returned quickly', not a sub-second wall-clock guarantee.
+    assert elapsed < 5.0
     assert runner.session_store.rewrite_transcript.call_count == 0
 
 

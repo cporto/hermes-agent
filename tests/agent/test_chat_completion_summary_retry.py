@@ -119,7 +119,9 @@ class TestSummaryRetriesOnTransientError:
                 result = cch.handle_max_iterations(agent, [], 60)
 
         assert not fb.called, "a deterministic 400 must NOT trigger fallback"
-        assert "couldn't summarize" in result
+        # Merged production returns the max_iterations_no_summary site copy (summary
+        # failed non-transiently), not the older "couldn't summarize" wording.
+        assert "couldn't produce a summary" in result
 
 
 class TestSummaryFallbackIsContained:

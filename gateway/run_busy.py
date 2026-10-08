@@ -272,15 +272,17 @@ class GatewayBusySessionMixin:
         children = getattr(running_agent, "_active_children", None)
         lock = getattr(running_agent, "_active_children_lock", None)
         spawning = getattr(running_agent, "_delegate_spawning", False)
-        # Real collections only — a ``MagicMock()._active_children`` auto-attr must not demote.
+        # Real collections only — a ``MagicMock()._active_children`` auto-attr must not demote,
+        # and ``_delegate_spawning`` only counts when it is a real bool (a truthy MagicMock
+        # auto-attr would otherwise falsely report subagents).
         try:
             if lock is not None:
                 with lock:
                     has_children = bool(children) if isinstance(children, (list, tuple, set)) else False
-                    has_spawning = bool(spawning)
+                    has_spawning = spawning is True
             else:
                 has_children = bool(children) if isinstance(children, (list, tuple, set)) else False
-                has_spawning = bool(spawning)
+                has_spawning = spawning is True
             return has_children or has_spawning
         except Exception:
             return False
