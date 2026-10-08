@@ -160,6 +160,8 @@ from gateway.platforms._shared import coerce_port as _coerce_port
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 from gateway.platforms.tcp_site import start_tcp_site
 from hermes_state_errors import SessionActiveWriteGuardError
+from gateway.run_busy import GatewayBusySessionMixin as _BusySessionMixin
+_agent_has_active_subagents = _BusySessionMixin._agent_has_active_subagents
 
 
 logger = logging.getLogger(__name__)
@@ -795,7 +797,7 @@ class ResponseStore:
 
 
 _CORS_HEADERS = {
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Session-Id"}
 _SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
@@ -1167,6 +1169,34 @@ def _run_route_delegate(name: str):
         return await getattr(_api_runs, name)(self, request, _api_server=sys.modules[__name__])
     _handler.__name__ = name
     return _handler
+
+
+_webui_sidecar_title_cache: dict = {}
+
+def _webui_sidecar_title(home, session_id):
+    """WebUI-owned title from <home>/webui/sessions/<sid>.json, else None (fails soft).
+
+    Path-traversal-guarded; mtime/size-cached so large sidecars aren't re-parsed on
+    every session-list call. Any error returns None so the gateway title is kept.
+    """
+    if not home or not session_id or any(c in session_id for c in "/\\.."):
+        return None
+    try:
+        from pathlib import Path
+        path = Path(home) / "webui" / "sessions" / f"{session_id}.json"
+        st = path.stat()
+        key = str(path)
+        cached = _webui_sidecar_title_cache.get(key)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        title = data.get("title")
+        title = title.strip() if isinstance(title, str) and title.strip() else None
+        _webui_sidecar_title_cache[key] = (st.st_mtime_ns, st.st_size, title)
+        return title
+    except Exception:
+        return None
 
 
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
@@ -1738,9 +1768,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
-            ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
-            ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
-            ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
+            ('GET', '/api/sessions/{session_id}/messages', self._handle_session_messages),
+            ('POST', '/api/sessions/{session_id}/fork', self._handle_fork_session),
+            ('POST', '/api/sessions/{session_id}/rewind', self._handle_rewind_session),
+            ('POST', '/api/sessions/{session_id}/approval', self._handle_session_approval),
+            ('POST', '/api/sessions/{session_id}/clarify', self._handle_session_clarify),
+            ('POST', '/api/sessions/{session_id}/chat', self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
@@ -2148,6 +2181,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             result["requested"] = {"provider": provider, "model": model}
         if model_lock or payload.get("model_lock"):
             result["model_lock"] = cls._clean_runtime_id(model_lock or payload.get("model_lock"), max_len=32)
+        # Preserve the context-usage fields for Mercury's header ring (they'd
+        # otherwise be dropped by this whitelist).
+        for _k in ("context_window", "compressor_threshold_tokens"):
+            if isinstance(payload.get(_k), (int, float)) and payload[_k] > 0:
+                result[_k] = payload[_k]
         return result
 
     @staticmethod
@@ -2382,6 +2420,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        # The api_server surface ships its own interactive clarify bridge (Mercury's
+        # ClarifyCard) via `agent.clarify_callback` when a client opts in. Surface the
+        # clarify tool so that bridge is reachable - without the tool the model can never
+        # ask a clarifying question even when a bridge IS wired. Contained to this
+        # surface; it does not touch the user's global toolset config.
+        if "clarify" not in enabled_toolsets:
+            enabled_toolsets = sorted(set(enabled_toolsets) | {"clarify"})
         # Reasoning resolves against the model that actually runs (per-model overrides), so only
         # after the precedence chain settles; an explicit request wins.
         if request_reasoning_config is None:
@@ -3072,6 +3117,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
+        # Archive visibility: defaults are unchanged (hide archived) so existing clients are
+        # unaffected. Explicitly request them to list archived-only / include archived rows
+        # (unblocks Mercury's reversible Archive). archived_only implies include.
+        include_archived = _coerce_request_bool(request.query.get("include_archived"), default=False)
+        archived_only = _coerce_request_bool(request.query.get("archived_only"), default=False)
+        if archived_only:
+            include_archived = True
         # Exact-title lookup (`hermes peer dm` -> canonical "Bot Chat"). include_hidden is honored
         # ONLY with a title filter: a blanket hidden listing stays off this client surface.
         title_filter = (request.query.get("title") or "").strip() or None
@@ -3084,12 +3136,26 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             rows = await asyncio.to_thread(
                 db.list_sessions_rich, source=source, limit=limit, offset=offset,
                 include_children=include_children, order_by_last_active=True, include_pinned=True,
-                search_query=title_filter, include_hidden=include_hidden)
+                search_query=title_filter, include_hidden=include_hidden,
+                include_archived=include_archived, archived_only=archived_only)
             if title_filter:
                 rows = [s for s in rows if (s.get("title") or "").strip() == title_filter]
             return rows
 
         sessions = await _list()
+
+        # Overlay WebUI-sidecar titles so Mercury/PWA production matches the WebUI
+        # sidebar; fails soft to the gateway title when no sidecar/title exists.
+        try:
+            from hermes_constants import get_hermes_home
+        except Exception:
+            get_hermes_home = lambda: None  # noqa: E731 — fails soft
+        _home = get_hermes_home()
+        for _s in sessions:
+            _t = _webui_sidecar_title(_home, _s.get("id"))
+            if _t:
+                _s["title"] = _t
+
         if title_filter and not sessions:
             # A canonical Bot Chat auto-archived by the orphan reaper would make `hermes peer dm`
             # mint transient sessions: resurrect and re-list; deliberate archives stay put.
@@ -3191,6 +3257,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
+
+        # overlay for single session (WebUI-sidecar title), fails soft
+        try:
+            from hermes_constants import get_hermes_home
+        except Exception:
+            get_hermes_home = lambda: None  # noqa: E731
+        _t = _webui_sidecar_title(get_hermes_home(), session.get("id"))
+        if _t:
+            session["title"] = _t
+
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
     @_require_auth
@@ -3343,6 +3419,151 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response(str(exc), 400, code="invalid_title")
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+
+    @_require_auth
+    async def _handle_rewind_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/rewind — rewind-to-point for Edit.
+
+        Truncates the session's ACTIVE transcript to just BEFORE the given user
+        message (rewind-to-point), soft-archiving the dropped turns (the same
+        durable /undo /retry primitive via ``replace_messages(archive_dropped=True)``),
+        and returns that target message's text so the client can prefill an edit.
+
+        Body: ``{"message_id": int}`` — the numeric row ``id`` of the USER message
+        to rewind to (the same id the messages route returns). After this call the
+        session's live transcript ends right before that message; the caller sends
+        the (possibly edited) prompt as a normal chat/stream turn to continue from
+        there. Returns ``{rewound_count, target_message_id, target_text, new_head_id}``.
+        """
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        raw = body.get("message_id")
+        try:
+            target = int(raw)
+        except (TypeError, ValueError):
+            return _error_response("message_id must be an integer", 400, code="invalid_message_id")
+        if target <= 0:
+            return _error_response("message_id must be a positive integer", 400, code="invalid_message_id")
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return self._session_db_unavailable()
+        resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
+        try:
+            history = await asyncio.to_thread(
+                db.get_messages_as_conversation, resolved_id,
+                repair_alternation=True, include_row_ids=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("rewind: failed to load transcript for %s: %s", session_id, exc)
+            return _error_response("Could not load session transcript", 500, code="transcript_unavailable")
+        # Find the target user message by row id; keep everything strictly before it.
+        idx = None
+        target_text = ""
+        for i, m in enumerate(history):
+            if m.get("role") == "user" and m.get("_row_id") == target:
+                idx = i
+                raw_content = m.get("content")
+                target_text = raw_content if isinstance(raw_content, str) else ("" if raw_content is None else str(raw_content))
+                target_text = " ".join(target_text.split())
+                break
+        if idx is None:
+            return _error_response(
+                "No active user message with that id in this session", 404, code="rewind_target_not_found")
+        truncated = history[:idx]
+        try:
+            await asyncio.to_thread(
+                db.replace_messages, resolved_id, truncated,
+                archive_dropped=True, reject_active_turn_lease=True)
+        except Exception as exc:
+            logger.warning("rewind: replace failed for %s: %s", session_id, exc)
+            return _error_response("Rewind failed; transcript was not changed", 409, code="rewind_rejected")
+        # New head = the last kept active message's row id (newest row before the rewind point).
+        new_head_id = truncated[-1].get("_row_id") if truncated else None
+        return web.json_response({
+            "object": "rewind", "session_id": resolved_id,
+            "rewound_count": len(history) - idx, "target_message_id": target,
+            "target_text": target_text, "new_head_id": new_head_id})
+
+    @_require_auth
+    async def _handle_session_approval(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/approval — resolve a pending interactive approval.
+
+        Companion to the native session SSE's interactive-approval opt-in (Mercury's
+        approval card). The pending approval is keyed by the gateway session key (from
+        the ``X-Hermes-Session-Key`` header, falling back to the session id), NOT the
+        run_id. Body: ``{\"choice\": \"once\"|\"session\"|\"always\"|\"deny\", \"request_id\"?, \"reason\"?}``.
+        Returns the number of approvals resolved (0 if none pending)."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+        session_key = (gateway_session_key or "").strip() or session_id or ""
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        choice = body.get("choice") or body.get("decision")
+        if not isinstance(choice, str) or choice not in ("once", "session", "always", "deny", "approve", "reject"):
+            return _error_response(
+                "choice must be one of: once, session, always, deny, approve, reject",
+                400, code="invalid_approval_choice")
+        # Normalize the Mercury card's approve/reject verbs onto the gateway's choices.
+        choice_map = {"approve": "once", "reject": "deny"}
+        choice = choice_map.get(choice, choice)
+        request_id = body.get("request_id")
+        reason = body.get("reason")
+        try:
+            from tools.approval import resolve_gateway_approval
+            resolved = await asyncio.to_thread(
+                resolve_gateway_approval, session_key, choice,
+                resolve_all=body.get("resolve_all") is True,
+                reason=(reason if isinstance(reason, str) and reason else None),
+                request_id=(request_id if isinstance(request_id, str) and request_id else None))
+        except Exception as exc:
+            return _error_response(_redact_api_error_text(exc), 500, code="approval_resolve_failed")
+        return web.json_response({"object": "approval", "session_id": session_id, "resolved": resolved})
+
+    @_require_auth
+    async def _handle_session_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/clarify - resolve a pending interactive clarify.
+
+        Companion to the native session SSE's interactive-clarify opt-in (Mercury's
+        ClarifyCard). The pending clarify is keyed by the random ``clarify_id`` that the
+        SSE emitted on THIS session's stream (only the client that received it can know
+        it, so it is effectively session-scoped). Body: ``{"clarify_id": str,
+        "response": str}``. Fail-closed: returns 409 when no listener has a pending
+        clarify with that id (expired via timeout, cancelled by session teardown, or
+        already resolved)."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        clarify_id = body.get("clarify_id")
+        response = body.get("response")
+        if not isinstance(clarify_id, str) or not clarify_id.strip():
+            return _error_response("clarify_id must be a non-empty string", 400, code="invalid_clarify_id")
+        if not isinstance(response, str):
+            return _error_response("response must be a string", 400, code="invalid_clarify_response")
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+            resolved = await asyncio.to_thread(resolve_gateway_clarify, clarify_id, response)
+        except Exception as exc:
+            return _error_response(_redact_api_error_text(exc), 500, code="clarify_resolve_failed")
+        if not resolved:
+            return _error_response(
+                "No pending clarify with that id on this gateway (already resolved, "
+                "cancelled, or expired)", 409, code="clarify_not_found")
+        return web.json_response({"object": "clarify", "session_id": session_id,
+                                  "clarify_id": clarify_id, "resolved": True})
 
     async def _prepare_session_chat(self, request: "web.Request") -> tuple:
         """Shared prelude for /api/sessions/{id}/chat[/stream]: header/body validation, then
@@ -3664,8 +3885,102 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
         approval_notify = self._register_session_stream_approval(run_id, events, message_id)
 
-        async def _run_and_signal() -> None:
+        # Interactive-approval opt-in (Mercury approval card): the client declares
+        # it wants dangerous commands surfaced as an approval.request on THIS stream
+        # instead of the silent unattended_mode deny. Read from the request body
+        # (interactive_approval: true) or the X-Hermes-Interactive-Approval header.
+        # Default OFF — a client that does not opt in keeps today's unattended policy.
+        _req_body = ctx.get("body") or {}
+        _interactive_approval = bool(
+            _req_body.get("interactive_approval") is True
+            or str(request.headers.get("X-Hermes-Interactive-Approval", "")).strip().lower() in ("1", "true", "yes"))
+        # Interactive-clarify opt-in (Mercury ClarifyCard): when the client declares it
+        # wants clarify questions surfaced on this stream (interactive_clarify: true or
+        # the X-Hermes-Interactive-Clarify header), wire the clarify tool's callback so a
+        # model clarify() ask becomes a clarify.request SSE event answered here instead of
+        # the tool erroring with _UNAVAILABLE (no callback). Default OFF - a client that
+        # does not opt in keeps today's behaviour (clarify tool present-but-unavailable).
+        _interactive_clarify = bool(
+            _req_body.get("interactive_clarify") is True
+            or str(request.headers.get("X-Hermes-Interactive-Clarify", "")).strip().lower() in ("1", "true", "yes"))
+
+        def _approval_notify(approval_data: dict) -> None:
+            """Bridge a gateway approval.request from the agent executor thread onto
+            this run's SSE, mirroring api_server_runs._make_approval_notify: redact the
+            flagged command, stamp choices, and thread-safely enqueue via
+            _SessionEventQueue.enqueue (which hops onto the owning loop from any thread)."""
             try:
+                _event = dict(approval_data or {})
+                if "command" in _event:
+                    from gateway.run import _redact_approval_command
+                    _event["command"] = _redact_approval_command(_event.get("command"))
+                _event["choices"] = _approval_event_choices(
+                    smart_denied=bool(_event.get("smart_denied")),
+                    allow_session=_event.get("allow_session") is not False,
+                    allow_permanent=_event.get("allow_permanent") is not False)
+                _event["run_id"] = run_id
+                _event["message_id"] = message_id
+                _event["request_id"] = _event.get("request_id") or approval_data.get("request_id")
+                events.enqueue("approval.request", _event)
+                self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=_event)
+            except Exception:
+                logger.exception("[api_server] approval-notify bridge failed")
+
+        def _clarify_callback_sync(question, choices, multi_select: bool = False):
+            """Bridge a clarify tool call from the agent thread onto this run's SSE and
+            block for the user's answer (clarify_tool's synchronous contract - the agent
+            runs on a worker thread, so blocking here never stalls the event loop).
+
+            Mirrors gateway/run_turn_runner._clarify_callback_sync but routes the prompt
+            onto the NATIVE session SSE as a clarify.request event (so the Mercury
+            ClarifyCard surfaces it), resolved via POST /api/sessions/{id}/clarify. Uses
+            the gateway's merged tools.clarify_gateway primitive so the tool needs no
+            per-surface logic. Fail-closed: wait_for_response returns None after the
+            configured timeout if the client never resolves (agent falls back to its own
+            best judgement) and the entry is cleaned up on session teardown."""
+            from tools import clarify_gateway as clarify_mod
+            import uuid
+            clarify_id = uuid.uuid4().hex[:10]
+            choices_l = list(choices) if choices else None
+            session_key = (gateway_session_key or "").strip() or session_id or ""
+            clarify_mod.register(
+                clarify_id=clarify_id, session_key=session_key, question=str(question),
+                choices=choices_l, multi_select=bool(multi_select))
+            try:
+                events.enqueue("clarify.request", {
+                    "clarify_id": clarify_id, "question": str(question), "choices": choices_l,
+                    "multi_select": bool(multi_select), "run_id": run_id, "message_id": message_id})
+            except Exception:
+                logger.exception("[api_server] clarify.request emit failed")
+            try:
+                timeout = clarify_mod.get_clarify_timeout()
+            except Exception:
+                timeout = 3600
+            return clarify_mod.wait_for_response(clarify_id, timeout=timeout)
+
+        async def _run_and_signal() -> None:
+            # Interactive-approval opt-in (Mercury approval card): when the client
+            # declared X-Hermes-Interactive-Approval, bind the opt-in CONTEXTVAR for
+            # this run's context. This makes _is_gateway_approval_context() return
+            # True for this api_server run even though api_server is normally in the
+            # unattended bucket (so dangerous commands prompt the human instead of the
+            # silent unattended_mode deny). Bind BEFORE run_conversation so the tool
+            # executor's approval gate sees it if it runs in this task's context; a
+            # worker-thread gate that can't see the contextvar is documented in HANDOFF
+            # as the residual risk (the notify below is the thread-safe delivery path).
+            _optin_token = None
+            _notify_key = None
+            try:
+                if _interactive_approval:
+                    from tools.approval_context import set_api_interactive_approval
+                    _optin_token = set_api_interactive_approval(True)
+                    try:
+                        from tools.approval import register_gateway_notify
+                        _notify_key = gateway_session_key or session_id or ""
+                        if _notify_key:
+                            register_gateway_notify(_notify_key, _approval_notify)
+                    except Exception:
+                        pass  # notify registration is best-effort; approve route still works
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
                     "runtime": runtime_meta}))
@@ -3676,7 +3991,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     conversation_history=history, stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
                     active_run_id=run_id, approval_notify_callback=approval_notify,
-                    approval_session_key=run_id, **ctx["run_kwargs"])
+                    approval_session_key=run_id,
+                    clarify_callback=_clarify_callback_sync if _interactive_clarify else None,
+                    **ctx["run_kwargs"])
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
@@ -3688,6 +4005,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
                     "content": final_response, **fields, "runtime": effective_runtime}))
+                # Surface a "context was compressed" notice when this turn's transcript
+                # was compacted (mid-turn rotation or in-place compaction). result["_compressed"]
+                # is set authoritatively in _finish_turn_result. Transient event: Mercury renders
+                # it as a notice in this turn; existing clients ignore unknown event types.
+                if is_dict and result.get("_compressed"):
+                    try:
+                        await queue.put(_event_payload("notice", {
+                            "display_kind": "compression",
+                            "message_id": message_id,
+                            "notice": "Context was compressed to keep things fast."}))
+                    except Exception:
+                        logger.exception("[api_server] compression-notice emit failed")
+                # A steer accepted after the final reply lands in result["pending_steer"]; surface
+                # it so clients can replay it rather than lose it.
+                pending_steer = result.get("pending_steer") if is_dict else None
+                if pending_steer:
+                    fields["pending_steer"] = pending_steer
                 await queue.put(_event_payload(f"run.{status}", {
                     "session_id": effective_session_id, "message_id": message_id, **fields,
                     "messages": turn_messages, "usage": usage, "runtime": effective_runtime}))
@@ -3706,6 +4040,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     run_id, "failed", error=_redact_api_error_text(exc), last_event="run.failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                # Unwrap the interactive-approval opt-in + notify so a concurrent
+                # run (or a later non-opted run) never inherits this context.
+                if _optin_token is not None:
+                    try:
+                        from tools.approval_context import reset_api_interactive_approval
+                        reset_api_interactive_approval(_optin_token)
+                    except Exception:
+                        pass
+                if _notify_key:
+                    try:
+                        from tools.approval import unregister_gateway_notify
+                        unregister_gateway_notify(_notify_key)
+                    except Exception:
+                        pass
                 self._active_run_agents.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._release_run_owner_if_forgotten(run_id)
@@ -3763,8 +4111,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 with suppress(Exception):
                     await task
             return
-        with suppress(Exception):
-            agent.interrupt(interrupt_message)
+        # Mirror the inbound-path guard (run_busy.py): don't interrupt a turn that is still
+        # driving active subagents just because the client's SSE stream dropped. The run is
+        # tracked in _active_run_agents and keeps running in the background, so it does not
+        # need a live client to listen. A genuine stop on a subagent-less turn still aborts.
+        if not _agent_has_active_subagents(agent):
+            with suppress(Exception):
+                agent.interrupt(interrupt_message)
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
@@ -4152,6 +4505,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if requested_runtime:
             model, provider = self._requested_ids(requested_runtime)
             runtime["requested"] = {"provider": provider, "model": model}
+        # Context-usage for Mercury's header ring: forward the model's context
+        # window and the compressor threshold so the frontend can show
+        # used/window (% full) and when compression is imminent. Both come from
+        # the agent's context_compressor (context_length is the CURRENT model's
+        # window, threshold_tokens is where the agent compresses). Input/used is
+        # already carried via usage.input_tokens (session_prompt_tokens).
+        _cc = getattr(agent, "context_compressor", None) or None
+        runtime["context_window"] = getattr(_cc, "context_length", 0) or 0
+        runtime["compressor_threshold_tokens"] = getattr(_cc, "threshold_tokens", 0) or 0
         runtime["route_source"] = route_source or runtime.get("route_source") or "global"
         return self._sanitize_runtime_metadata(
             runtime=runtime, requested_runtime=requested_runtime or None, route_source=route_source or "global",
@@ -4197,7 +4559,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
-        approval_session_key: Optional[str] = None) -> tuple:
+        approval_session_key: Optional[str] = None,
+        clarify_callback=None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``approval_notify_callback`` (with ``approval_session_key``) routes dangerous-command
         approval requests to the caller's stream, keyed like ``/v1/runs`` approvals (#51871).
@@ -4241,6 +4604,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                    # Wire the interactive clarify bridge if the request opted in. Runs on
+                    # the worker agent thread; clarify_tool hands this a (question/choices)
+                    # ask and blocks until the resident clears it (clarify_gateway Event).
+                    if clarify_callback is not None:
+                        agent.clarify_callback = clarify_callback
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if resume_unanswered_turn:
@@ -4553,6 +4921,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         f"Port {self._port} already in use. Set "
                         f"platforms.api_server.port in config.yaml to a "
                         f"different value, then `/platform resume api_server`.",
+                        retryable=False)
+                else:
+                    # Any other bind OSError (EACCES, EADDRNOTAVAIL, EINVAL, ...) is likewise a
+                    # permanent misconfiguration, not a transient blip — routing it through a bare
+                    # ``return False`` would have the reconnect watcher retry forever and leak a
+                    # ResponseStore fd pair each time (the #52132 pattern). Fail fast, non-retryable.
+                    self._set_fatal_error(
+                        "api_server_bind_failed",
+                        f"Could not bind {self._host}:{self._port}: {exc}",
                         retryable=False)
                 logger.error(
                     "[%s] Could not bind %s:%d: %s. Set a different port in "

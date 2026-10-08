@@ -42,6 +42,8 @@ def _agent():
 
 
 @pytest.mark.parametrize("flag", RESTART_FLAGS)
+
+
 def test_single_restart_still_reissues_the_iteration(flag):
     """A lone correction / fallback activation keeps its refund-and-continue contract."""
     agent = _agent()
@@ -53,6 +55,8 @@ def test_single_restart_still_reissues_the_iteration(flag):
 
 
 @pytest.mark.parametrize("flag", RESTART_FLAGS)
+
+
 def test_back_to_back_restart_refunds_are_bounded(flag):
     """Re-arming the flag every iteration breaks after ``max_retries`` refunds instead of
     refunding forever (the turn ends, so the session turn lease is released)."""
@@ -88,6 +92,8 @@ def _interrupted_agent(tool_interrupt_reason):
     ("cron inactivity watchdog", "interrupted_by_system(cron_inactivity_watchdog)"),
     ("turn liveness watchdog", "interrupted_by_system(turn_liveness_watchdog)"),
 ])
+
+
 def test_interrupt_exit_reason_names_the_system_issuer(tool_interrupt_reason, expected):
     """A watchdog abort must not be recorded as a user stop: the exit reason carries the issuer."""
     verdict = _interrupted_agent(tool_interrupt_reason)
@@ -95,6 +101,8 @@ def test_interrupt_exit_reason_names_the_system_issuer(tool_interrupt_reason, ex
 
 
 @pytest.mark.parametrize("flag", RESTART_FLAGS)
+
+
 def test_response_between_restarts_resets_the_bound(flag):
     """#128000: the user answering clarify cards / sending follow-ups while the model works
     redirects once per request, with a response in between. The bound is for requests that
@@ -112,3 +120,67 @@ def test_response_between_restarts_resets_the_bound(flag):
         restart_count = verdict.restart_count
     assert actions == ["continue"] * (3 * MAX_RETRIES)
     assert agent.steered == []
+
+
+def test_begin_iteration_reaper_interrupt_does_not_break():
+    """An SSE reaper interrupt means 'no client listening', not 'user stop': the
+    iteration must fall through so the armed recovery can re-issue the turn."""
+    agent = _begin_agent(interrupt_requested=True, interrupt_message=SSE_REAPER_MSG)
+    result = _call_begin(agent)
+    assert result.action == "fallthrough"
+    assert result._turn_exit_reason is None
+
+
+def test_begin_iteration_reaper_task_cancelled_does_not_break():
+    """The sibling reaper message behaves identically to the disconnect one."""
+    agent = _begin_agent(interrupt_requested=True, interrupt_message="SSE task cancelled")
+    result = _call_begin(agent)
+    assert result.action == "fallthrough"
+    assert result._turn_exit_reason is None
+
+
+def test_begin_iteration_genuine_interrupt_breaks():
+    """A genuine user interrupt (carrying the user's own text) still breaks."""
+    agent = _begin_agent(interrupt_requested=True, interrupt_message=GENUINE_MSG)
+    result = _call_begin(agent)
+    assert result.action == "break"
+    assert result._turn_exit_reason == "interrupted_by_user"
+    assert result.interrupted is True
+
+
+def test_apply_reaper_interrupt_with_length_continuation_continues():
+    """Reaper interrupt + armed length continuation: the recovery must run, not break."""
+    agent = _apply_agent(interrupt_requested=True, interrupt_message=SSE_REAPER_MSG)
+    _retry = _retry_state(length_continue=True)
+    result = _call_apply(agent, _retry)
+    assert result.action == "continue"
+    assert result._turn_exit_reason is None
+
+
+def test_apply_reaper_interrupt_with_rebuilt_messages_continues():
+    """Reaper interrupt + armed rebuilt-messages fallback: the recovery must run."""
+    agent = _apply_agent(interrupt_requested=True, interrupt_message=SSE_REAPER_MSG)
+    _retry = _retry_state(rebuilt=True)
+    result = _call_apply(agent, _retry)
+    assert result.action == "continue"
+    assert result._turn_exit_reason is None
+
+
+def test_apply_reaper_interrupt_no_recovery_armed_breaks():
+    """Reaper interrupt with no recovery armed: no restart to honor, so break."""
+    agent = _apply_agent(interrupt_requested=True, interrupt_message=SSE_REAPER_MSG)
+    _retry = _retry_state()
+    result = _call_apply(agent, _retry)
+    assert result.action == "break"
+    assert result._turn_exit_reason == "interrupted_during_api_call"
+
+
+def test_apply_genuine_interrupt_wins_even_with_recovery_armed():
+    """A genuine user stop still wins even when a recovery is armed."""
+    agent = _apply_agent(interrupt_requested=True, interrupt_message=GENUINE_MSG)
+    _retry = _retry_state(length_continue=True)
+    result = _call_apply(agent, _retry)
+    assert result.action == "break"
+    assert result._turn_exit_reason == "interrupted_during_api_call"
+
+

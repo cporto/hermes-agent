@@ -636,7 +636,7 @@ DEFAULT_CONFIG = {
         "hygiene_timeout_seconds": 30,
         # Absolute cap on the hygiene wait even while tokens are moving (bounds a trickle stream).
         # Clamped >= hygiene_timeout_seconds.
-        "hygiene_total_ceiling_seconds": 600,
+        "hygiene_total_ceiling_seconds": 90,
         "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts
         # Max seconds an ARRIVING user turn is held while a streaming hygiene summary finishes;
         # bounds user-visible latency (keep under chat idle timeouts, Telegram ~30s). On expiry the

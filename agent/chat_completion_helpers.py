@@ -1979,6 +1979,22 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         unavailable.add(fb_key)
         logger.warning("Fallback skip: %s/%s is not locally usable (%s); suppressing for this session", fb_provider, fb_model, local_skip_reason)
         return True
+    # Capability-aware admission: a fallback entry may declare a max_prefill_tokens ceiling
+    # (e.g. a 16GB local model that can only prefill ~24k tokens). Skip it when the in-flight
+    # request's prompt exceeds that ceiling instead of attempting prefill and hitting the
+    # memory guard / OOM (Claude Code review, 2026-09-25).
+    max_prefill = fb.get("max_prefill_tokens")
+    try:
+        max_prefill = int(max_prefill) if max_prefill not in (None, "") else None
+    except (TypeError, ValueError):
+        max_prefill = None
+    if max_prefill and max_prefill > 0:
+        req_tokens = getattr(agent, "_last_prompt_size_tokens", None)
+        if req_tokens and req_tokens > max_prefill:
+            logger.warning(
+                "Fallback skip: entry %s/%s declares max_prefill_tokens=%s but request is %s tokens",
+                fb_provider, fb_model, max_prefill, req_tokens)
+            return True
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
     # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
@@ -1991,6 +2007,18 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         logger.warning(
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider)
+        return True
+
+    # Per-source fallback policy (Claude Code review): a cron-sourced turn (no human to
+    # notice a 3am fallback) must not cascade onto the local/interactive tier. An entry
+    # marked 'interactive_only: true' is that tier; refuse it for cron runs.
+    if (
+        getattr(agent, "platform", "") == "cron"
+        and bool(fb.get("interactive_only"))
+    ):
+        logger.warning(
+            "Fallback skip: entry %s/%s is interactive_only; refusing local fallback for cron run",
+            fb_provider, fb_model)
         return True
     return False
 
@@ -2318,19 +2346,55 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         build_attempt = _SUMMARY_ATTEMPT_BUILDERS.get(agent.api_mode, _chat_summary_attempt)
         attempt = build_attempt(agent, api_messages, summary_api_request_id)
 
-        # One retry on an empty summary; a summary empty once its <think> block is stripped is NOT retried.
+        # Retry TRANSIENT provider errors (429 / engine_overloaded / rate limit / model busy)
+        # with jittered backoff, reusing the main loop's backoff policy and api_max_retries budget.
+        # The summary is the LAST call of the turn, so a bounded retry adds only latency — strictly
+        # better than surfacing the raw provider error. Empty-text still retries once (existing behavior).
+        max_retries = max(int(getattr(agent, "_api_max_retries", 3) or 3), 1)
         final_response = _EMPTY_SUMMARY_RESPONSE
-        for retry_count in (0, 1):
-            text = attempt(retry_count)
-            if not text:
-                continue
-            if "<think>" in text:
-                text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
-            if text:
+        transient_exhausted = False
+        attempt_idx = 0
+        attempt_count = 0
+        while True:
+            if attempt_count >= max_retries:
+                # retries exhausted: one contained fallback below (do NOT make an extra attempt)
+                transient_exhausted = True
+                break
+            try:
+                text = attempt(attempt_idx)
+                if not text:
+                    # empty summary: retry once (existing behavior), then give up if still empty
+                    if attempt_count == 0:
+                        attempt_count += 1
+                        attempt_idx += 1
+                        continue
+                    break
+                if " thinking" in text:
+                    text = re.sub(r' thinking.*? response\s*', '', text, flags=re.DOTALL).strip()
+                if text:
+                    summary_call_outcome = "success"
+                    append_message(messages, {"role": "assistant", "content": text})
+                    final_response = text
+                break
+            except Exception as _summary_err:
+                if not _is_transient_summary_error(_summary_err):
+                    raise  # non-transient: let the outer except emit the failure string
+                attempt_count += 1
+                attempt_idx += 1
+                _wait = _summary_jittered_backoff(attempt_count)
+                logger.warning(
+                    "Summary call failed (attempt %s/%s) — transient error, retrying in %.1fs: %s",
+                    attempt_count, max_retries, _wait, _summary_err,
+                )
+                time.sleep(_wait)
+
+        # One contained fallback after transient retries exhausted, before giving up.
+        if transient_exhausted and final_response == _EMPTY_SUMMARY_RESPONSE:
+            fb_text = _summary_fallback_attempt(agent, api_messages, summary_api_request_id)
+            if fb_text:
                 summary_call_outcome = "success"
-                append_message(messages, {"role": "assistant", "content": text})
-                final_response = text
-            break
+                append_message(messages, {"role": "assistant", "content": fb_text})
+                final_response = fb_text
 
     except InterruptedError:
         # Cancellation is not a summary failure: drop the unanswered nudge and let the
@@ -2348,6 +2412,94 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
 
     return final_response
+
+
+def _is_transient_summary_error(error: Exception) -> bool:
+    """True for errors a single summary call should safely retry: HTTP 429 rate-limit /
+    provider-overload / 'Model busy, retry later' / engine_overloaded. Conservative: everything
+    else (auth 401/403, bad-request 400, schema/validation, malformed payload) is NOT retried."""
+    cls_matches = type(error).__name__ in ("RateLimitError",) or \
+        (type(error).__module__ or "").startswith("openai") and type(error).__name__ == "RateLimitError"
+    if cls_matches:
+        return True
+    text = f"{error}".lower()
+    return ("429" in text or "engine_overloaded" in text or "rate limit" in text
+            or "model busy" in text or "retry later" in text or "overloaded" in text
+            or "too many requests" in text)
+
+
+def _summary_jittered_backoff(retry_count: int) -> float:
+    """Jittered backoff for the summary retry, mirroring the main loop's policy (base 2s, cap 60s)."""
+    try:
+        from agent.retry_utils import jittered_backoff
+        return jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+    except Exception:
+        import random
+        return min(60.0, 2.0 * (2.0 ** max(0, retry_count - 1))) * (0.5 + random.random() * 0.5)
+
+
+def _summary_fallback_attempt(agent, api_messages: list, summary_api_request_id: str) -> str:
+    """One CONTAINED, non-mutating fallback summary attempt on the NEXT different provider.
+
+    Builds a throwaway client via resolve_provider_client and calls chat.completions.create
+    ONCE. Returns non-empty summary text on success, or "" on any failure/disqualification.
+    Never touches agent.model/provider/base_url/client — the session stays on its original
+    provider after this returns."""
+    chain = list(getattr(agent, "_fallback_chain", None) or [])
+    if not chain:
+        return ""
+    primary_base_l = (getattr(agent, "base_url", "") or "").strip().lower()
+    primary_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    # Iterate fallbacks; skip same-provider OR same-base_url entries (would re-hit the overloaded engine)
+    for fb in chain:
+        if not isinstance(fb, dict):
+            continue
+        fb_provider = (fb.get("provider") or "").strip().lower()
+        fb_base = (fb.get("base_url") or "").strip().lower()
+        if fb_provider and fb_provider == primary_provider:
+            continue
+        if fb_base and fb_base and fb_base == primary_base_l:
+            continue
+        fb_model = (fb.get("model") or "").strip()
+        if not fb_provider or not fb_model:
+            continue
+        try:
+            from hermes_cli.fallback_config import resolve_entry_api_key
+            from agent.auxiliary_client import resolve_provider_client
+            from hermes_cli.model_normalize import normalize_model_for_provider
+            api_key = resolve_entry_api_key(fb)
+            fb_base_url_hint = (fb.get("base_url") or "").strip() or None
+            from agent.secret_scope import get_secret
+            if fb_base_url_hint and "ollama.com" in fb_base_url_hint and not api_key:
+                api_key = get_secret("OLLAMA_API_KEY") or None
+            fb_client, resolved_model = resolve_provider_client(
+                fb_provider, model=fb_model, raw_codex=True,
+                explicit_base_url=fb_base_url_hint, explicit_api_key=api_key)
+            if fb_client is None:
+                continue
+            use_model = normalize_model_for_provider(fb_model, fb_provider) or resolved_model or fb_model
+            # Reuse the existing summary kwargs builder against the fallback model
+            summary_kwargs = _iteration_summary_chat_kwargs(agent, api_messages)
+            summary_kwargs["model"] = use_model
+            try:
+                from agent import relay_llm
+                response = relay_llm.execute_current(
+                    summary_kwargs,
+                    lambda request: fb_client.chat.completions.create(**request),
+                    name=fb_provider, model_name=use_model,
+                    metadata={"api_mode": str(getattr(agent, "api_mode", "") or "chat_completions"),
+                              "api_request_id": summary_api_request_id, "call_role": "iteration_summary_fallback"},
+                    defer_logical_completion=True,
+                )
+            except Exception:
+                continue
+            text = _summary_text(agent, response)
+            if text:
+                logger.warning("Iteration summary fell back to %s (%s)", use_model, fb_provider)
+                return text
+        except Exception:
+            continue
+    return ""
 
 
 def cleanup_task_resources(agent, task_id: str) -> None:

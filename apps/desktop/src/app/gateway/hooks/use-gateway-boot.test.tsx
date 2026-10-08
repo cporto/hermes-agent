@@ -2481,7 +2481,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
   // and force-closes it when the liveness ping times out. A backend that is
   // merely BUSY (a long silent tool call holding the loop) fails that probe
   // without being dead — closing the socket mid-turn is exactly what feeds the
-  // gateway's ws_orphan_reap interrupt ("Operation interrupted." placeholder).
+  // gateway's ws_orphan_reap interrupt ("The turn did not complete." placeholder).
   // While any session still reports working, one inconclusive timeout must
   // defer the teardown (bounded re-probe) instead of killing the transport.
   it('wake probe: a timeout while a turn is IN FLIGHT defers the force-close', async () => {

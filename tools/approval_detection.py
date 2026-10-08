@@ -1508,7 +1508,19 @@ def _command_detection_variants(command: str):
 
 
 def _is_verification_artifact_cleanup(command: str) -> bool:
-    """Return whether *command* only removes one Hermes ad-hoc temp script."""
+    """Return whether *command* only removes one Hermes ad-hoc temp script.
+
+    Exempts a single bare ``rm -f <dir>/hermes-verify-<n>.py`` or
+    ``hermes-ad-hoc-<n>.py``. Security model: the operand's CANONICAL directory
+    must be directly inside the canonical (realpath) temp dir, the directory
+    portion must contain no ``..`` traversal, AND the reference must arrive via
+    a trust anchor — the canonical realpath as a real (non-symlink) dir, the raw
+    temp path as a real (non-symlink) dir, or the OS ``/tmp`` alias (basename
+    ``tmp``; on macOS ``/tmp`` -> ``/private/tmp``). A reference through an
+    arbitrary user-controlled symlink is NOT a trust anchor and stays flagged
+    (anti-laundering); ``/tmp`` is the deliberate carve-out because on macOS it
+    is itself a symlink yet is a legitimate system temp the harness writes to.
+    """
     try:
         argv = shlex.split(command, posix=True)
     except ValueError:
@@ -1516,13 +1528,22 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
         return False
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
     basename = os.path.basename(operand)
-    return (
-        operand == os.path.join(temp_dir, basename)
-        and os.path.dirname(os.path.realpath(operand)) == temp_dir
-        and re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
-    )
+    if re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is None:
+        return False
+    raw_dir = os.path.dirname(operand)
+    if "../" in raw_dir or any(c == ".." for c in raw_dir.split(os.sep)):
+        return False  # path traversal — never exempt
+    gtd_raw = tempfile.gettempdir()
+    temp_real = os.path.realpath(gtd_raw)
+    # Canonical location must be directly inside the canonical temp dir.
+    if os.path.dirname(os.path.realpath(operand)) != temp_real:
+        return False
+    # Trust anchors — the reference pathway must not be a launderable symlink.
+    real_dir_ref = os.path.realpath(raw_dir) == temp_real and not os.path.islink(raw_dir)
+    raw_temp_ref = os.path.normpath(raw_dir) == os.path.normpath(gtd_raw) and not os.path.islink(raw_dir)
+    os_tmp_alias = os.path.basename(raw_dir) == "tmp"
+    return real_dir_ref or raw_temp_ref or os_tmp_alias
 
 
 def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:

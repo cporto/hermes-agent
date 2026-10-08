@@ -744,6 +744,23 @@ def finalize_turn(
     _leftover_steer = agent._drain_pending_steer()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
+        # Durable persistence: write the steer as a display_kind=steer user row so it
+        # survives even if no live client replays `pending_steer` (e.g. the SSE client
+        # disconnected and never returns to replay — the case where Carlos's nudge was
+        # previously lost entirely). SKIP when the accept-time persist (api_server_runs
+        # _handle_steer_run) already wrote it durably — that path is the primary guard
+        # and runs on interrupt; this finalizer persist is the fallback for when accept-
+        # time couldn't (tail was user, or no session db). Either way the transcript has
+        # EXACTLY one steer row. Appending role=user after the shaped assistant tail
+        # keeps alternation legal. Best-effort — never mask the turn result.
+        if not getattr(agent, "_steer_durably_persisted", False):
+            try:
+                from agent.prompt_builder import steer_user_row
+                messages.append(steer_user_row(_leftover_steer))
+                agent._persist_session(messages, conversation_history)
+            except Exception:
+                logger.exception("[finalize] failed to persist leftover steer durably")
+        setattr(agent, "_steer_durably_persisted", False)
     agent._response_was_previewed = False
     agent._reused_response_text = None
     if interrupted and agent._interrupt_message:

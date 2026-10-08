@@ -74,3 +74,49 @@ def test_ordinary_partial_is_kept_as_the_interrupted_row():
     assert (messages[-1]["role"], messages[-1]["content"]) == ("assistant", "Visible draft.")
     assert messages[-1]["display_metadata"] == {"interrupted": True}
     assert verdict.final_response == "Visible draft."
+
+
+def test_reaper_0s_no_recovery_reissues_and_does_not_flag_interrupted():
+    """A 0.0s SSE reaper interrupt with no partial output / no armed recovery must
+    re-issue the same logical iteration (continue via redirect restart) and keep
+    ``interrupted`` False — NOT end the turn with 'Operation interrupted'."""
+    agent = _agent(interrupt_message=SSE_REAPER_MSG)
+    r = _retry()
+    verdict = _call(agent, r=r)
+    assert verdict.action == "break"  # leaves the retry loop; outer rebuilds
+    assert verdict.interrupted is False  # do NOT latch interrupted=True
+    assert r.restart_with_redirected_messages is True  # re-issue same iteration
+    assert agent._calls["cleared"] == 1  # transport-only interrupt consumed
+
+
+def test_reaper_task_cancelled_reissues_like_disconnect():
+    """The sibling reaper message behaves identically to the disconnect one."""
+    agent = _agent(interrupt_message=SSE_TASK_CANCELLED)
+    r = _retry()
+    verdict = _call(agent, r=r)
+    assert verdict.interrupted is False
+    assert r.restart_with_redirected_messages is True
+
+
+def test_reaper_with_armed_recovery_left_to_existing_path():
+    """A reaper interrupt WITH an armed recovery must fall through to that recovery
+    (the length-continuation / rebuilt-messages path), not be re-issued via redirect."""
+    agent = _agent(interrupt_message=SSE_REAPER_MSG)
+    r = _retry(length_continue=True)
+    verdict = _call(agent, r=r)
+    # Leaves the retry loop and latches interrupted (existing handle path); the
+    # apply_retry_restarts gate then runs the armed recovery.
+    assert verdict.interrupted is True
+    assert r.restart_with_redirected_messages is False
+
+
+def test_genuine_user_stop_still_flags_interrupted():
+    """A genuine user stop (non-reaper message) still ends the turn interrupted."""
+    agent = _agent(interrupt_message=GENUINE_MSG)
+    r = _retry()
+    verdict = _call(agent, r=r)
+    assert verdict.interrupted is True
+    assert r.restart_with_redirected_messages is False
+    assert agent._calls["cleared"] == 0
+
+

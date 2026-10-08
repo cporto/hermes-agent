@@ -557,6 +557,7 @@ _CONTROL_STATE: Dict[str, Any] = {
     "_delegate_depth": 0,
     "_active_children": list,
     "_active_children_lock": threading.Lock,
+    "_delegate_spawning": False,
     # Background review (agent/background_review.py): the run is installed before the worker
     # starts and fences its first provider phase; the agent pointer enables interrupt fan-out.
     "_background_review_agent": None,

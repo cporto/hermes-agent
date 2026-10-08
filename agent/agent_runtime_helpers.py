@@ -3789,7 +3789,16 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # user message (which persists like any other user turn).
         _requeue_pending_steer(agent, steer_text)
         return
-    messages.append(steer_user_row(steer_text))
+    _steer_row = steer_user_row(steer_text)
+    # If the accept-time durable persist already wrote this steer (display_kind=steer
+    # row in the transcript), stamp the LIVE row so the next flush writes no second
+    # copy — the transcript keeps exactly one steer row. This is the tool-batch drain
+    # path whose former flush-on-next-API-call was lost on an interrupt.
+    if getattr(agent, "_steer_durably_persisted", False):
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+        _steer_row[_DB_PERSISTED_MARKER] = True
+        setattr(agent, "_steer_durably_persisted", False)
+    messages.append(_steer_row)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),

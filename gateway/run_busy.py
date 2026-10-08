@@ -270,13 +270,18 @@ class GatewayBusySessionMixin:
         if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
             return False
         children = getattr(running_agent, "_active_children", None)
-        # Real collections only — a ``MagicMock()._active_children`` auto-attr must not demote.
-        if not isinstance(children, (list, tuple, set)) or not children:
-            return False
         lock = getattr(running_agent, "_active_children_lock", None)
+        spawning = getattr(running_agent, "_delegate_spawning", False)
+        # Real collections only — a ``MagicMock()._active_children`` auto-attr must not demote.
         try:
-            with lock if lock is not None else contextlib.nullcontext():
-                return bool(children)
+            if lock is not None:
+                with lock:
+                    has_children = bool(children) if isinstance(children, (list, tuple, set)) else False
+                    has_spawning = bool(spawning)
+            else:
+                has_children = bool(children) if isinstance(children, (list, tuple, set)) else False
+                has_spawning = bool(spawning)
+            return has_children or has_spawning
         except Exception:
             return False
 

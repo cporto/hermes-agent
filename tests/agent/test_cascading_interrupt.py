@@ -117,26 +117,37 @@ def test_anthropic_non_streaming_stale_aborts_request_client_not_shared():
     agent._abort_request_anthropic_client = MagicMock()
     agent._close_request_anthropic_client = MagicMock()
 
+    release_worker = threading.Event()
+
     def _create(_api_kwargs, *, client):
         assert client is request_client
-        # Outlive the 0.05s stale timeout AND the worker join (2.0s) so the
-        # stale detector surfaces its TimeoutError.
-        time.sleep(2.5)
+        # Block until the test releases after the stale detector aborts and
+        # raises, so the worker can never return before the timer fires
+        # (prevents the flaky "DID NOT RAISE TimeoutError" when a loaded
+        # runner lets the mock finish first).
+        release_worker.wait(15.0)
         return object()
 
     agent._anthropic_messages_create = MagicMock(side_effect=_create)
 
-    with pytest.raises(TimeoutError):
-        cch.interruptible_api_call(agent, {"model": "x", "messages": []})
+    try:
+        with pytest.raises(TimeoutError):
+            cch.interruptible_api_call(agent, {"model": "x", "messages": []})
 
-    # Shared client untouched from the poll thread.
-    agent._anthropic_client.close.assert_not_called()
-    agent._rebuild_anthropic_client.assert_not_called()
-    # Poll (stranger) thread aborts the request-local client's socket only.
-    agent._abort_request_anthropic_client.assert_called_once_with(
-        request_client, reason="stale_call_kill"
-    )
-    # Worker unblocks and closes its own request client from its own thread.
-    _wait_for_mock_call(agent._close_request_anthropic_client)
+        # Shared client untouched from the poll thread.
+        agent._anthropic_client.close.assert_not_called()
+        agent._rebuild_anthropic_client.assert_not_called()
+        # Poll (stranger) thread aborts the request-local client's socket only.
+        agent._abort_request_anthropic_client.assert_called_once_with(
+            request_client, reason="stale_call_kill"
+        )
+        # Release the worker so it unblocks and closes its own client.
+        release_worker.set()
+        # Worker unblocks and closes its own request client from its own thread.
+        _wait_for_mock_call(agent._close_request_anthropic_client)
+    finally:
+        # Guarantee a blocked daemon worker never hangs the suite if any
+        # assertion above fails before the explicit release.
+        release_worker.set()
 
 

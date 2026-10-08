@@ -23,7 +23,6 @@ from agent.turn_truncation import boosted_output_cap
 
 logger = logging.getLogger("agent.conversation_loop")
 
-
 def _anchors_current_turn(messages: Any, idx: Any, user_message: Any) -> bool:
     """True when ``messages[idx]`` is this turn's user row (verbatim, or its user-originated view)."""
     if not isinstance(idx, int) or not 0 <= idx < len(messages):
@@ -37,6 +36,21 @@ def _anchors_current_turn(messages: Any, idx: Any, user_message: Any) -> bool:
 
     view = user_originated_turn_view(msg)
     return view is not None and view.get("content") == user_message
+_SSE_REAPER_INTERRUPT_MESSAGES = frozenset({"SSE client disconnected", "SSE task cancelled"})
+
+
+def _is_sse_reaper_interrupt(agent):
+    """True when the interrupt is an SSE transport reaper, not user intent to stop.
+
+    On the api_server/WebUI path, a provider mid-stream drop tears down the browser
+    SSE leg, and the api_server drains the session stream with
+    ``agent.interrupt("SSE client disconnected")`` / ``("SSE task cancelled")``. Those
+    messages mean "no client listening", NOT that the user wants the turn stopped — the
+    same transport event arms text-continuation recovery elsewhere. A genuine user stop
+    carries the user's own text (or "/stop") and is unaffected by this check.
+    """
+    msg = getattr(agent, "_interrupt_message", None)
+    return isinstance(msg, str) and msg in _SSE_REAPER_INTERRUPT_MESSAGES
 
 ITERATION_BUDGET_WARNING_TEMPLATE = (
     "[SYSTEM NOTICE — iteration budget checkpoint] You have used {used} of {maximum} "
@@ -288,7 +302,15 @@ def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
             from agent.prompt_builder import steer_user_row
-            messages.insert(_si + 1, steer_user_row(steer_text))
+            from agent.context_compressor import _DB_PERSISTED_MARKER
+            _row = steer_user_row(steer_text)
+            # The accept-time persist may have already written this steer durably as
+            # a display_kind=steer row; stamp the LIVE row so the next flush does NOT
+            # write a second durable copy (exactly one steer row in the transcript).
+            if getattr(agent, "_steer_durably_persisted", False):
+                _row[_DB_PERSISTED_MARKER] = True
+                setattr(agent, "_steer_durably_persisted", False)
+            messages.insert(_si + 1, _row)
             logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
             return
     from agent.agent_runtime_helpers import _requeue_pending_steer
@@ -379,7 +401,7 @@ def begin_iteration(
     # Reset per-turn checkpoint dedup so each iteration can take one snapshot.
     agent._checkpoint_mgr.new_turn()
 
-    if agent._interrupt_requested:
+    if agent._interrupt_requested and not _is_sse_reaper_interrupt(agent):
         interrupted = True
         _issuer = interrupt_issuer(agent)
         _turn_exit_reason = f"interrupted_by_system({_issuer})" if _issuer else "interrupted_by_user"
@@ -489,7 +511,7 @@ def apply_retry_restarts(
         _retry.restart_with_redirected_messages = False
         return _verdict("continue")
 
-    if interrupted:
+    if interrupted and not (_is_sse_reaper_interrupt(agent) and (_retry.restart_with_length_continuation or _retry.restart_with_rebuilt_messages)):
         _turn_exit_reason = interrupted_during_api_call_reason(agent)
         return _verdict("break")
 
