@@ -230,7 +230,8 @@ def _rebalance_json_closers(raw: str) -> str | None:
 def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     """Repair malformed tool_call argument JSON (truncation, trailing commas, Python ``None``,
     control chars); ``"{}"`` if unrepairable so the request succeeds. Repairs log at WARNING."""
-    raw_stripped = raw_args.strip() if isinstance(raw_args, str) else ""
+    raw_stripped = (raw_args.lstrip("\ufeff\u200b\u200c\u200d").strip()
+                    if isinstance(raw_args, str) else "")
 
     if not raw_stripped:
         logger.warning("Sanitized empty tool_call arguments for %s", tool_name)

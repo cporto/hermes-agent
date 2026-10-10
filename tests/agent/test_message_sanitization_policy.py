@@ -447,3 +447,34 @@ def test_normalize_provider_ids_leaves_single_and_mixed_batches_unchanged():
         before = [c.copy() for c in calls]
         normalize_provider_tool_call_ids(calls)
         assert calls == before
+
+
+# ---------------------------------------------------------------------------
+# F5: BOM / zero-width-mark intake recovery (regression)
+# ---------------------------------------------------------------------------
+
+class TestRepairToolCallBomRecovery:
+    """A leading BOM (U+FEFF) or zero-width mark is stripped at intake instead of
+    forcing the '{}' fallback (see _repair_tool_call_arguments)."""
+
+    def test_bom_prefix_recovered_not_fallback(self):
+        from agent.message_sanitization import _repair_tool_call_arguments
+        import json
+        out = _repair_tool_call_arguments('\ufeff{"n": 5}', 'bom-test')
+        assert out != '{}'
+        assert json.loads(out).get('n') == 5
+
+    def test_zero_width_marks_recovered(self):
+        from agent.message_sanitization import _repair_tool_call_arguments
+        import json
+        for mark in ['\u200b', '\u200c', '\u200d']:
+            out = _repair_tool_call_arguments(mark + '{"m": 1}', 'zw-test')
+            assert out != '{}', repr(mark)
+            assert json.loads(out).get('m') == 1
+
+    def test_control_char_recovery_still_intact(self):
+        from agent.message_sanitization import _repair_tool_call_arguments
+        import json
+        out = _repair_tool_call_arguments('{"note": "line one\nline two"}', 'nl-test')
+        assert out != '{}'
+        assert json.loads(out).get('note') == 'line one\nline two'
