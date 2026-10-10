@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+from tools.json_escape import escape_raw_control_chars
+
 # Placeholder shapes for batch goal validation: bare 'TODO' / 'task N' labels, or unexpanded template markers. The
 # marker regex is deliberately NARROW — only snake_case / space-separated placeholder identifiers (`<feature_name>`,
 # `{file path}`, `<FEATURE-NAME>`), the shape LLM templates leave behind. Bare single-word brackets must never be
@@ -28,7 +30,15 @@ def _recover_tasks_from_json_string(tasks: Any) -> tuple[Optional[List[Dict[str,
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return None, f"tasks must be a JSON array of task objects; received a string that could not be parsed as JSON ({exc.msg})."
+        # Recovery pass: tolerate unescaped control chars (literal newlines etc.)
+        # that LLM-emitted JSON often carries inside string values.
+        try:
+            parsed = json.loads(escape_raw_control_chars(raw))
+        except json.JSONDecodeError as exc2:
+            return None, (
+                f"tasks must be a JSON array of task objects; received a string that could not be parsed "
+                f"as JSON ({exc2.msg}) — also after escaping unescaped control characters."
+            )
     if not isinstance(parsed, list):
         return None, f"tasks must be a JSON array of task objects; parsed {type(parsed).__name__} instead."
     return parsed, None

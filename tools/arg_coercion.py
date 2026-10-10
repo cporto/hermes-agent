@@ -10,6 +10,7 @@ import json
 import logging
 from typing import Any, Dict
 
+from tools.json_escape import escape_raw_control_chars
 from tools.registry import registry
 
 # Logger name kept as "model_tools": these messages were always emitted under
@@ -112,7 +113,12 @@ def _normalize_json_strings_for_schema(value: Any, schema: Any) -> Any:
         try:
             parsed = json.loads(trimmed)
         except (ValueError, TypeError):
-            return value
+            # Recovery pass: tolerate unescaped control chars (literal newlines etc.)
+            # that LLM-emitted JSON often carries inside string values.
+            try:
+                parsed = json.loads(escape_raw_control_chars(trimmed))
+            except (ValueError, TypeError):
+                return value
         if not ((isinstance(parsed, list) and expects_array) or (isinstance(parsed, dict) and expects_object)):
             return value
         value = parsed
@@ -171,8 +177,13 @@ def _coerce_json(value: str, expected_python_type: type):
     try:
         parsed = json.loads(value)
     except (ValueError, TypeError) as exc:
-        logger.warning("coerce_tool_args: failed to parse string as JSON for expected type %s: %s", name, exc)
-        return value
+        # Recovery pass: tolerate unescaped control chars (literal newlines etc.)
+        # that LLM-emitted JSON often carries inside string values.
+        try:
+            parsed = json.loads(escape_raw_control_chars(value))
+        except (ValueError, TypeError):
+            logger.warning("coerce_tool_args: failed to parse string as JSON for expected type %s: %s", name, exc)
+            return value
     if isinstance(parsed, expected_python_type):
         logger.debug("coerce_tool_args: coerced string to %s via json.loads", name)
         return parsed
