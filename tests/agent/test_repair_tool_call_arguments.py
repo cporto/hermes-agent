@@ -93,4 +93,20 @@ class TestRepairToolCallArguments:
 
     # -- Stage 4: control-char escape fallback --
 
+    # -- Pass 1: unescaped-quote repair (fail-closed) --
+    # A raw double-quote inside a JSON string VALUE is restored only when the repair
+    # is unambiguous; otherwise the "{}" fallback is kept.
+
+    def test_unescaped_quotes_repaired_when_unambiguous(self):
+        assert json.loads(_repair_tool_call_arguments('{"note": "say "hi" and more"}', "t")) == {"note": 'say "hi" and more'}
+
+    def test_truncated_unescaped_quotes_keep_empty_object_fallback(self):
+        assert _repair_tool_call_arguments('{"note": "say "hi" and more', "t") == "{}"
+
+    def test_key_quote_keeps_empty_object_fallback(self):
+        assert _repair_tool_call_arguments('{"ke"y": 1}', "t") == "{}"
+
+    def test_ambiguous_unescaped_quotes_keep_empty_object_fallback(self):
+        assert _repair_tool_call_arguments('{"a": "x" "b": "y"}', "t") == "{}"
+
 

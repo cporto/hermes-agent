@@ -227,6 +227,108 @@ def _rebalance_json_closers(raw: str) -> str | None:
     return "".join(out) + "".join(_JSON_CLOSERS[ch] for ch in reversed(stack))
 
 
+def _quote_is_structural(raw: str, i: int) -> bool:
+    """True when the double-quote at index i must be a STRUCTURAL quote in any valid JSON.
+    A structural quote's nearest non-whitespace neighbour is a structural delimiter
+    ({ [ , : before it, or } ] , : after it) or a document edge. A literal quote inside
+    a string VALUE has string content on both sides, so it is never delimiter-adjacent."""
+    j = i - 1
+    while j >= 0 and raw[j].isspace():
+        j -= 1
+    k = i + 1
+    while k < len(raw) and raw[k].isspace():
+        k += 1
+    if j < 0 or k >= len(raw):
+        return True
+    return raw[j] in '{[,:' or raw[k] in '}],:'
+
+
+def _key_string_indices(raw: str) -> set:
+    """Indices of every char that lies inside a KEY string (G3: never repair a quote in a
+    KEY). A key string is a quoted span immediately followed by ':' (ignoring whitespace);
+    quotes inside the span that are NOT followed by ':' (malformed, e.g. ``{"ke"y": 1}``)
+    are treated as literal key content so that stray quote never becomes a repair candidate.
+    """
+    key_region: set = set()
+    i, n = 0, len(raw)
+    while i < n:
+        if raw[i] != '"':
+            i += 1
+            continue
+        # A key's closing quote is the first quote whose next non-whitespace char is ':':
+        # treat every earlier quote in this span as literal key content.
+        k = i
+        found = False
+        while k < n:
+            k += 1
+            while k < n and raw[k] != '"':
+                k += 1
+            if k >= n:
+                break
+            m = k + 1
+            while m < n and raw[m].isspace():
+                m += 1
+            if m < n and raw[m] == ':':
+                key_region.update(range(i, k + 1))
+                i = k + 1
+                found = True
+                break
+        if not found:
+            i += 1
+    return key_region
+
+
+def _repair_unescaped_quotes(raw: str) -> "str | None":
+    """Escape clearly-unambiguous unescaped interior-prose quotes in ``raw``; unique-parse
+    gate. Fail-closed: ``None`` when the repair is ambiguous or too large to enumerate."""
+    key_region = _key_string_indices(raw)
+    candidates = [
+        i for i, ch in enumerate(raw)
+        if ch == '"' and i not in key_region and not _quote_is_structural(raw, i)
+    ]
+    # G2: drop candidates whose nearest non-ws neighbour on either side is a structural char
+    # ({ } [ ] , : ") — only interior-prose quotes are repairable.
+    structural = set('{}[],:"')
+    candidates = [
+        i for i in candidates
+        if not (
+            (i - 1 >= 0 and raw[i - 1].isspace() and _prev_non_ws(raw, i) in structural)
+            or (i + 1 < len(raw) and raw[i + 1].isspace() and _next_non_ws(raw, i) in structural)
+        )
+    ]
+    if len(candidates) > 12:
+        return None
+    solutions = set()
+    for mask in range(1 << len(candidates)):
+        out = list(raw)
+        for idx, pos in enumerate(candidates):
+            if mask & (1 << idx):
+                out[pos] = '\\"'
+        candidate = "".join(out)
+        try:
+            parsed = json.loads(candidate, strict=True)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+        solutions.add(json.dumps(parsed, separators=(",", ":")))
+    if len(solutions) == 1:
+        return next(iter(solutions))
+    return None
+
+
+def _prev_non_ws(raw: str, i: int) -> str:
+    j = i - 1
+    while j >= 0 and raw[j].isspace():
+        j -= 1
+    return raw[j] if j >= 0 else ''
+
+
+def _next_non_ws(raw: str, i: int) -> str:
+    j = i + 1
+    while j < len(raw) and raw[j].isspace():
+        j += 1
+    return raw[j] if j < len(raw) else ''
+
+
 def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     """Repair malformed tool_call argument JSON (truncation, trailing commas, Python ``None``,
     control chars); ``"{}"`` if unrepairable so the request succeeds. Repairs log at WARNING."""
@@ -250,6 +352,12 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
         return reserialised
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
+
+    # Pass 1: unescaped-quote repair - only when UNIQUE.
+    quote_repaired = _repair_unescaped_quotes(raw_stripped)
+    if quote_repaired is not None:
+        logger.warning("Repaired unescaped quotes in tool_call arguments for %s", tool_name)
+        return quote_repaired
 
     # Passes 2-4: strip trailing commas, close unclosed structures, trim excess closers
     # (bounded). Bracket counting is string-aware: delimiters inside string values
