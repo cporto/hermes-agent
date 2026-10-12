@@ -3053,7 +3053,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 status_state["phase"] = "awaiting_approval"
             elif any(s.get("status") in {"error", "failed"} for s in run_statuses):
                 status_state["phase"] = "error"
-            elif active_runs > 0 and busy:
+            elif (active_runs > 0) or busy:
                 status_state["phase"] = "working"
             else:
                 status_state["phase"] = "idle"
