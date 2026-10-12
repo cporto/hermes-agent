@@ -3066,8 +3066,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         activity_widget = {
             "id": "activity", "kind": "activity", "schemaVersion": 1,
             "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
-            "state": {"events": []}}
+            "state": {"events": self._widget_activity_events()}}
         return [status_widget, activity_widget]
+
+    def _widget_activity_events(self):
+        """Recent terminal runs -> humanized activity events, newest first."""
+        terminal = {"completed", "failed", "cancelled", "error"}
+        evs = []
+        for s in self._run_statuses.values():
+            if s.get("status") not in terminal:
+                continue
+            st = s.get("status")
+            label = "Run finished" if st == "completed" else (
+                "Run failed" if st == "failed" else ("Run cancelled" if st == "cancelled" else "Run hit an error"))
+            evs.append({"type": "run", "status": st, "text": label,
+                        "runId": s.get("run_id") or s.get("runId"),
+                        "finishedAt": int((s.get("finished_at") or s.get("updated_at") or 0) * 1000)})
+        evs.sort(key=lambda e: e["finishedAt"], reverse=True)
+        return evs[:6]
 
     def _widget_last_run(self) -> Optional[dict[str, Any]]:
         """Optional lastRun for the status widget: the most recent terminal structured run's
