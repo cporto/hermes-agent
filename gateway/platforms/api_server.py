@@ -166,6 +166,10 @@ _agent_has_active_subagents = _BusySessionMixin._agent_has_active_subagents
 
 logger = logging.getLogger(__name__)
 
+# Monotonic source for the A1 WidgetState `rev` field (an integer). The exact value is not
+# contractual — only that it increases across refreshes so clients can order changes.
+_WIDGETS_REV_COUNTER = itertools.count(1)
+
 
 def _browser_controller_ws_sender(ws, loop, *, wait_timeout: float = 10.0):
     """Return a loop-aware broker sender for one aiohttp controller socket.
@@ -1761,6 +1765,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/browser-control/ws", self._handle_browser_control_ws),
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
+            ("GET", "/v1/widgets", self._handle_widgets),
+            ("GET", "/v1/widgets/{widget_id}", self._handle_widget),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -2983,6 +2989,108 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("GET /v1/skills failed")
             return _error_response("Failed to enumerate skills", 500, err_type="server_error")
         return web.json_response({"object": "list", "data": skills})
+
+    def _widgets_enabled(self) -> bool:
+        """A1 widget-publisher feature flag — additive + reversible. Defaults ON so the route
+        works out of the box for the live server; tests monkeypatch this to turn it off (an
+        off flag makes /v1/widgets return [] and /v1/widgets/{id} 404, never a break)."""
+        return True
+
+    @_require_auth
+    async def _handle_widgets(self, request: web.Request) -> web.Response:
+        """GET /v1/widgets — the current status + activity widgets as a plain JSON ARRAY (the
+        Mercury listWidgets client expects an array body, not {"data": [...]})."""
+        if not self._widgets_enabled():
+            return web.json_response([])
+        return web.json_response(self._build_aggregate_widgets())
+
+    @_require_auth
+    async def _handle_widget(self, request: web.Request) -> web.Response:
+        """GET /v1/widgets/{widget_id} — narrow refresh of a single widget ("status" |
+        "activity"), same shape as the batch. Unknown (or disabled) ids 404."""
+        widget_id = request.match_info.get("widget_id", "")
+        if not self._widgets_enabled():
+            return _error_response(f"Unknown widget: {widget_id}", 404, code="widget_not_found")
+        widgets = {w["id"]: w for w in self._build_aggregate_widgets()}
+        widget = widgets.get(widget_id)
+        if widget is None:
+            return _error_response(f"Unknown widget: {widget_id}", 404, code="widget_not_found")
+        return web.json_response(widget)
+
+    def _build_aggregate_widgets(self) -> list[dict[str, Any]]:
+        """Project existing gateway-owned state into the two A1 WidgetState widgets. Both share
+        the envelope {id, kind, schemaVersion, updatedAt(epoch-ms), rev, state}. Every data
+        lookup is defensive: a hiccup degrades to a minimal idle status widget rather than
+        failing the whole list (auth is handled separately by the decorator)."""
+        updated_at_ms = int(time.time() * 1000)
+        status_state: dict[str, Any] = {"phase": "idle"}
+        active_runs = 0
+        busy = False
+        try:
+            payload = self._api_server_status_payload(heartbeat_at=time.time())
+            active_runs = int(payload.get("active_runs") or 0)
+            status_state["activeRuns"] = active_runs
+            status_state["storedRuns"] = int(payload.get("stored_runs") or 0)
+            if isinstance(payload.get("metrics_today"), dict):
+                status_state["metricsToday"] = payload["metrics_today"]
+        except Exception:
+            logger.exception("GET /v1/widgets status-payload lookup failed")
+        try:
+            from gateway.status import derive_gateway_busy, parse_active_agents, read_runtime_status
+            runtime = read_runtime_status() or {}
+            gw_state = runtime.get("gateway_state")
+            gw_active = parse_active_agents(runtime.get("active_agents", 0))
+            status_state["activeAgents"] = gw_active
+            busy = bool(derive_gateway_busy(
+                gateway_running=True, gateway_state=gw_state, active_agents=gw_active))
+            status_state["gatewayBusy"] = busy
+        except Exception:
+            logger.exception("GET /v1/widgets runtime enrichment failed")
+            busy = active_runs > 0
+        try:
+            run_statuses = self._run_statuses.values()
+            if any(s.get("status") == "waiting_for_approval" for s in run_statuses):
+                status_state["phase"] = "awaiting_approval"
+            elif any(s.get("status") in {"error", "failed"} for s in run_statuses):
+                status_state["phase"] = "error"
+            elif active_runs > 0 and busy:
+                status_state["phase"] = "working"
+            else:
+                status_state["phase"] = "idle"
+        except Exception:
+            status_state["phase"] = "idle"
+        status_state["lastRun"] = self._widget_last_run()
+        status_widget = {
+            "id": "status", "kind": "status", "schemaVersion": 1,
+            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER), "state": status_state}
+        activity_widget = {
+            "id": "activity", "kind": "activity", "schemaVersion": 1,
+            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
+            "state": {"events": []}}
+        return [status_widget, activity_widget]
+
+    def _widget_last_run(self) -> Optional[dict[str, Any]]:
+        """Optional lastRun for the status widget: the most recent terminal structured run's
+        status/tokens (if present in existing run state), else None. Never raises."""
+        try:
+            terminal = {"completed", "failed", "error", "cancelled"}
+            candidates = [s for s in self._run_statuses.values()
+                          if s.get("status") in terminal]
+            if not candidates:
+                return None
+            latest = candidates[-1]
+            last: dict[str, Any] = {"status": latest.get("status")}
+            tokens = latest.get("usage") or latest.get("tokens")
+            if isinstance(tokens, dict):
+                if tokens.get("input_tokens") is not None:
+                    last["inputTokens"] = tokens["input_tokens"]
+                if tokens.get("output_tokens") is not None:
+                    last["outputTokens"] = tokens["output_tokens"]
+            if latest.get("finished_at") is not None:
+                last["finishedAt"] = latest["finished_at"]
+            return last
+        except Exception:
+            return None
 
     @_require_auth
     async def _handle_toolsets(self, request: web.Request) -> web.Response:
