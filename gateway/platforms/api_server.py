@@ -3049,11 +3049,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             busy = active_runs > 0
         try:
             run_statuses = self._run_statuses.values()
-            if any(s.get("status") == "waiting_for_approval" for s in run_statuses):
+            # Recency-guard: a run record only counts toward a non-idle phase if
+            # it touched state within the live window. A record stuck in a
+            # non-terminal status (leaked running) ages out after
+            # _WIDGET_LIVE_TTL so the pill cannot be pinned to a phase forever.
+            now = time.time()
+            live = [
+                s for s in run_statuses
+                if now - float(s.get("updated_at", 0) or 0) <= self._WIDGET_LIVE_TTL
+            ]
+            if any(s.get("status") == "waiting_for_approval" for s in live):
                 status_state["phase"] = "awaiting_approval"
-            elif any(s.get("status") in {"error", "failed"} for s in run_statuses):
+            elif any(s.get("status") in {"error", "failed"} for s in live):
                 status_state["phase"] = "error"
-            elif (active_runs > 0) or busy:
+            elif any(s.get("status") in {"queued", "running", "waiting_for_approval", "stopping"} for s in live) or busy:
                 status_state["phase"] = "working"
             else:
                 status_state["phase"] = "idle"
@@ -4847,6 +4856,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # -- /v1/runs, room grants, room dispatch: thin delegators (real methods: tests assert
     # __dict__ membership and patch the module-level implementations) ---------------------
 
+    _WIDGET_LIVE_TTL = 120  # seconds of recency a run needs to keep a non-idle pill phase
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
