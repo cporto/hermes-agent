@@ -3076,37 +3076,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "id": "activity", "kind": "activity", "schemaVersion": 1,
             "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
             "state": {"events": self._widget_activity_events()}}
-        try:
-            approval_items = self._widget_approval_items()
-        except Exception:
-            logger.exception("GET /v1/widgets approval lookup failed")
-            approval_items = []
-        approvals_widget = {
-            "id": "approvals", "kind": "approvals", "schemaVersion": 1,
-            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
-            "state": {"items": approval_items, "count": len(approval_items)}}
-
-        try:
-            spend_state = self._widget_spend_state()
-        except Exception:
-            logger.exception("GET /v1/widgets spend lookup failed")
-            spend_state = {}
-        spend_widget = {
-            "id": "spend", "kind": "spend", "schemaVersion": 1,
-            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
-            "state": spend_state}
-
-        try:
-            delegate_state = self._widget_delegate_state()
-        except Exception:
-            logger.exception("GET /v1/widgets delegate lookup failed")
-            delegate_state = {}
-        delegate_widget = {
-            "id": "delegate", "kind": "delegate", "schemaVersion": 1,
-            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
-            "state": delegate_state}
-
-        return [status_widget, activity_widget, approvals_widget, spend_widget, delegate_widget]
+        # AMBIENT PILLS SHELVED (Carlos 2026-10-14): approvals/spend/delegate
+        # widget kinds disabled at the source — they caused noise/errors on the
+        # Telegram side and weren't useful in the header. Kept, not deleted:
+        # the _widget_approval_items/_widget_spend_state/_widget_delegate_state
+        # helpers above remain defined for later refinement. Restore by
+        # un-commenting the three widget builders and putting them in the return.
+        return [status_widget, activity_widget]
 
 
     def _widget_approval_items(self) -> list[dict[str, Any]]:
