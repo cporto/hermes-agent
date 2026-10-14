@@ -3076,7 +3076,113 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "id": "activity", "kind": "activity", "schemaVersion": 1,
             "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
             "state": {"events": self._widget_activity_events()}}
-        return [status_widget, activity_widget]
+        try:
+            approval_items = self._widget_approval_items()
+        except Exception:
+            logger.exception("GET /v1/widgets approval lookup failed")
+            approval_items = []
+        approvals_widget = {
+            "id": "approvals", "kind": "approvals", "schemaVersion": 1,
+            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
+            "state": {"items": approval_items, "count": len(approval_items)}}
+
+        try:
+            spend_state = self._widget_spend_state()
+        except Exception:
+            logger.exception("GET /v1/widgets spend lookup failed")
+            spend_state = {}
+        spend_widget = {
+            "id": "spend", "kind": "spend", "schemaVersion": 1,
+            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
+            "state": spend_state}
+
+        try:
+            delegate_state = self._widget_delegate_state()
+        except Exception:
+            logger.exception("GET /v1/widgets delegate lookup failed")
+            delegate_state = {}
+        delegate_widget = {
+            "id": "delegate", "kind": "delegate", "schemaVersion": 1,
+            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
+            "state": delegate_state}
+
+        return [status_widget, activity_widget, approvals_widget, spend_widget, delegate_widget]
+
+
+    def _widget_approval_items(self) -> list[dict[str, Any]]:
+        """Approval-waiting runs -> lightweight pill items, newest first.
+        Each carries just enough to render + deep-link; the full approval
+        payload stays on the run record and the SSE stream. Never raises."""
+        try:
+            now = time.time()
+            items: list[dict[str, Any]] = []
+            for s in self._run_statuses.values():
+                if s.get("status") != "waiting_for_approval":
+                    continue
+                if now - float(s.get("updated_at", 0) or 0) > self._WIDGET_LIVE_TTL:
+                    continue
+                appr = s.get("approval") or {}
+                if not isinstance(appr, dict):
+                    appr = {}
+                item: dict[str, Any] = {"runId": s.get("run_id") or s.get("runId") or "", "updatedAt": now}
+                for src_key, out_key in (("session_id", "sessionId"), ("tool_name", "tool"),
+                                         ("description", "description"), ("command", "command")):
+                    val = appr.get(src_key)
+                    if isinstance(val, str) and val.strip():
+                        item[out_key] = val.strip()
+                items.append(item)
+            items.sort(key=lambda it: float(it.get("updatedAt") or 0), reverse=True)
+            return items
+        except Exception:
+            return []
+
+    def _widget_spend_state(self) -> dict[str, Any]:
+        """Today's server-wide token/request tally plus an estimated USD cost.
+        Reuses the real in-memory daily metrics (metrics_today); cost is a
+        best-effort blended estimate (~$0.75/1M tokens) since the daily tally
+        does not track cost. Never raises."""
+        try:
+            m = self._api_server_status_payload().get("metrics_today") or {}
+            tokens = int(m.get("tokens") or 0)
+            state: dict[str, Any] = {
+                "day": m.get("day"),
+                "requests": int(m.get("requests") or 0),
+                "messages": int(m.get("messages") or 0),
+                "tokens": tokens,
+            }
+            # Prefer real per-run cost already tracked in run state (recent
+            # terminal runs); fall back to a clearly-labeled blended estimate
+            # (~$1.00/1M tokens) only when no run has cost data.
+            prc = 0.0
+            for s in self._run_statuses.values():
+                c = s.get("cost_usd")
+                if c is None:
+                    c = s.get("estimated_cost_usd")
+                if isinstance(c, (int, float)):
+                    prc += float(c)
+            state["estCostUsd"] = round(prc if prc > 0 else tokens * 1.0e-6, 4)
+            return state
+        except Exception:
+            return {"tokens": 0, "requests": 0, "messages": 0}
+
+    def _widget_delegate_state(self) -> dict[str, Any]:
+        """Kanban/delegateboard activity at a glance. Lazy-imports the board so
+        the widget rail stays decoupled; any absent/locked board or import
+        error degrades to a zero state rather than breaking /v1/widgets."""
+        empty = {"cards": {"ready": 0, "running": 0, "blocked": 0, "review": 0, "done": 0},
+                 "active": 0, "recent": []}
+        try:
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_db_connect as kbc
+            status_keys = ("ready", "running", "blocked", "review", "done")
+            counts = {k: 0 for k in status_keys}
+            with kbc.connect_closing(board=None) as conn:
+                for k in status_keys:
+                    counts[k] = len(kb.list_tasks(conn, status=k, include_archived=False))
+            active = counts["running"] + counts["ready"] + counts["blocked"]
+            return {"cards": counts, "active": active, "recent": []}
+        except Exception:
+            return empty
 
     def _widget_activity_events(self):
         """Recent terminal runs -> humanized activity events, newest first."""
