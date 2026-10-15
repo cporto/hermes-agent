@@ -724,6 +724,13 @@ CREATE INDEX IF NOT EXISTS idx_messages_active_null
 -- Logical-identity recovery (agent.transcript_repair._active_logical_message_row) runs inside the write lock.
 CREATE INDEX IF NOT EXISTS idx_messages_session_uid
     ON messages(session_id, message_uid) WHERE active = 1;
+-- Structural backstop: ONE active steer row per (session, message_uid). Past duplication bugs
+-- (flush-path double-write, compaction carry/clone) produced >1 active rows for one steer; all
+-- writer paths now reuse one uid and exempt steers from compaction rewind+clone, so a same-uid
+-- active steer should never be inserted twice. If any path ever slips, fail-closed with
+-- IntegrityError instead of silently duplicating.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_steer_uid
+    ON messages(session_id, message_uid) WHERE display_kind = 'steer' AND active = 1;
 CREATE INDEX IF NOT EXISTS idx_sessions_session_key
     ON sessions(session_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
