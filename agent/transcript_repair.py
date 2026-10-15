@@ -136,6 +136,27 @@ def resolve_and_repair_transcript_batch(
             # Logical identity + the CAS version prove this dict came from durable replay. A new message
             # has neither proof, even when role/content/timestamp happen to equal an older message exactly.
             target_row = _active_logical_message_row(conn, session_id, role, message_uid_or_none(msg))
+        if (
+            target_row is None
+            and (msg.get("display_kind") if isinstance(msg, dict) else None) == "steer"
+            and isinstance(msg, dict)
+        ):
+            # Write-side de-dup for mid-run steers. A steer's message_uid is minted once per
+            # logical message and never derived from content, so an active row with the same
+            # (session_id, role, message_uid) IS this very steer already durable. In-place arg
+            # repair pops _DB_PERSISTED_MARKER off stamped live dicts, so the marked/drain path
+            # above (snapshot-gated) can miss it and this row would otherwise be fresh-inserted
+            # as a same-uid duplicate. Re-stamp identity and skip the duplicate insert instead.
+            _steer_uid = message_uid_or_none(msg)
+            if _steer_uid is not None:
+                _steer_existing = _active_logical_message_row(
+                    conn, session_id, role, _steer_uid
+                )
+                if _steer_existing is not None:
+                    msg[_DB_PERSISTED_MARKER] = True
+                    if isinstance(_steer_existing["id"], int):
+                        msg["_row_id"] = int(_steer_existing["id"])
+                    continue  # already durable -> do not insert a duplicate row
         if target_row is None:
             inserted_rows.append(msg)
             continue
