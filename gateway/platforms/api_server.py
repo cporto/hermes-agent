@@ -380,11 +380,39 @@ def _is_compressed_summary_message(message: Any) -> bool:
     return is_compaction_summary_message(message)
 
 
+_STEER_MARKER_OPEN = (
+    "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered "
+    "once at this position; not tool output and not a new delivery when replayed from conversation history]"
+)
+_STEER_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
+
+
+def _project_steer_for_display(message: dict) -> dict | None:
+    """For a display_kind=steer row, strip the internal OUT-OF-BAND wrapper from
+    content for client display. Returns a projected copy, or None if not a steer row.
+    Display-only: the model-facing replay path (get_messages_as_conversation) keeps
+    the wrapper intact."""
+    if message.get("display_kind") != "steer":
+        return None
+    content = message.get("content") or ""
+    if isinstance(content, str) and content.lstrip().startswith(_STEER_MARKER_OPEN):
+        body = content.lstrip()[len(_STEER_MARKER_OPEN):]
+        if _STEER_MARKER_CLOSE in body:
+            body = body.split(_STEER_MARKER_CLOSE, 1)[0]
+        content = body.strip()
+    projected = {k: v for k, v in message.items()}
+    projected["content"] = content
+    return projected
+
+
 def _project_client_message(message: dict[str, Any]) -> dict[str, Any]:
     """Strip compaction scaffolding: standalone handoffs become hidden empty rows (stable
     ids), merged handoffs keep only the real prior-tail content; inherited tool calls dropped."""
     from agent.compaction_display import (
         _COMPACTION_INTERNAL_FIELDS, project_compaction_message_for_display)
+    _steer_projected = _project_steer_for_display(message)
+    if _steer_projected is not None:
+        return _steer_projected
     if (message.get("display_kind") == "hidden"
             and (message.get("display_metadata") or {}).get("notification_category") == "diagnostic"):
         # Retain row identity and execution evidence in storage, not in the notification UI.
@@ -397,6 +425,25 @@ def _project_client_message(message: dict[str, Any]) -> dict[str, Any]:
         projected["content"] = ""
         projected["display_kind"] = "hidden"
     return projected
+
+
+def _dedupe_display_steer_rows(messages: list[dict]) -> list[dict]:
+    """Read-side dedupe for the api_server message list. A durable mid-run steer can
+    be written as several rows with identical content+timestamp+display_kind='steer'
+    on the default non-compacted read path (which skips the display-generation
+    dedupe). Collapse duplicate steer rows to the FIRST occurrence each (oldest id,
+    preserving order). Non-steer rows pass through untouched; distinct steers are
+    kept (even when written far apart / interleaved with other messages)."""
+    out: list[dict] = []
+    seen_steer: set = set()
+    for m in messages:
+        if m.get("display_kind") == "steer":
+            key = (m.get("content") or "").strip()
+            if key in seen_steer:
+                continue
+            seen_steer.add(key)
+        out.append(m)
+    return out
 
 
 def _auto_truncate_response_history(
@@ -3364,7 +3411,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         try:
             from hermes_constants import get_hermes_home
         except Exception:
-            get_hermes_home = lambda: None  # noqa: E731 — fails soft
+            get_hermes_home = lambda: None
         _home = get_hermes_home()
         for _s in sessions:
             _t = _webui_sidecar_title(_home, _s.get("id"))
@@ -3477,7 +3524,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         try:
             from hermes_constants import get_hermes_home
         except Exception:
-            get_hermes_home = lambda: None  # noqa: E731
+            get_hermes_home = lambda: None
         _t = _webui_sidecar_title(get_hermes_home(), session.get("id"))
         if _t:
             session["title"] = _t
@@ -3585,13 +3632,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         messages = await asyncio.to_thread(
             db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page,
             include_compacted=include_compacted, include_ancestors=True)
+        deduped = _dedupe_display_steer_rows(messages)
         return web.json_response({
             "object": "list", "session_id": resolved_id,
-            "data": [self._message_response(m) for m in messages],
+            "data": [self._message_response(m) for m in deduped],
             "pagination": {
                 "limit": limit, "offset": offset,
                 "order": order or ("latest" if default_page else "oldest"),
-                "returned": len(messages)}})
+                "returned": len(deduped)}})
 
     @_require_auth
     async def _handle_fork_session(self, request: web.Request) -> web.Response:
