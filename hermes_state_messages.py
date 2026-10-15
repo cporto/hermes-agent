@@ -943,15 +943,28 @@ class SessionMessagesMixin:
         compacted transcript, then clone them so they stay live and searchable once each.
         """
         active_ids = [int(row["id"]) for row in conn.execute(_ACTIVE_IDS_SQL, (session_id,)).fetchall()]
+        # Fixed identity for mid-run steers: a steer is ONE logical message (message_uid minted
+        # once, never content-derived). Compaction must not rewind+clone it, or each in-place
+        # compaction appends a duplicate active row (observed: 1 steer -> N+1 rows across N
+        # compactions). Exempt active steer rows from the unseen/clone and rewind paths so they
+        # keep their single original active row.
+        steer_ids = {
+            int(row["id"]) for row in conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND display_kind = 'steer' AND active = 1",
+                (session_id,))
+        }
         covered_set = set(covered)
         carried_ids = self._resolve_carried_row_ids(conn, session_id, carried_messages or [])
         covered_set.update(carried_ids)
-        unseen = [row_id for row_id in active_ids if row_id not in covered_set]
+        unseen = [row_id for row_id in active_ids if row_id not in covered_set and row_id not in steer_ids]
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
-        rewind_ids = list(carried_ids)
+        rewind_ids = [row_id for row_id in carried_ids if row_id not in steer_ids]
         if tail_count > 0:
-            rewind_ids += self._tail_originals(covered_active, tail_count, merged_away)
-        rewind_ids += unseen
+            rewind_ids += [
+                row_id for row_id in self._tail_originals(covered_active, tail_count, merged_away)
+                if row_id not in steer_ids
+            ]
+        rewind_ids += [row_id for row_id in unseen if row_id not in steer_ids]
         rewind_ids = list(dict.fromkeys(rewind_ids))
         if rewind_ids:
             placeholders = _placeholders(rewind_ids)
@@ -960,6 +973,13 @@ class SessionMessagesMixin:
                 f"WHERE session_id = ? AND id IN ({placeholders})",
                 [session_id, *rewind_ids])
         conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
+        # The archive sweep sets every active row to active=0, compacted=1, so restore the exempted
+        # steer rows (same id, active=1, compacted=0) to keep one steer = one active row forever.
+        if steer_ids:
+            ph = _placeholders(sorted(steer_ids))
+            conn.execute(
+                f"UPDATE messages SET active = 1, compacted = 0 WHERE id IN ({ph}) AND display_kind = 'steer'",
+                [*sorted(steer_ids)])
         # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
         # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
         # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
