@@ -744,7 +744,7 @@ def finalize_turn(
         result["cleanup_errors"] = _cleanup_errors
     # A /steer landing after the final assistant turn has no tool batch to drain into;
     # hand it back so it becomes the next user turn instead of being lost.
-    _leftover_steer = agent._drain_pending_steer()
+    _leftover_steer, _leftover_uid = agent._drain_pending_steer()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
         # Durable persistence: write the steer as a display_kind=steer user row so it
@@ -759,11 +759,14 @@ def finalize_turn(
         if not getattr(agent, "_steer_durably_persisted", False):
             try:
                 from agent.prompt_builder import steer_user_row
-                messages.append(steer_user_row(_leftover_steer))
+                _row = steer_user_row(_leftover_steer)
+                if _leftover_uid:
+                    _row["message_uid"] = _leftover_uid
+                messages.append(_row)
                 agent._persist_session(messages, conversation_history)
             except Exception:
                 logger.exception("[finalize] failed to persist leftover steer durably")
-        setattr(agent, "_steer_durably_persisted", False)
+        agent._steer_durably_persisted = False
     agent._response_was_previewed = False
     agent._reused_response_text = None
     if interrupted and agent._interrupt_message:

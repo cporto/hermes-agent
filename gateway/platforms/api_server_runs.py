@@ -1271,7 +1271,15 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
             from agent.prompt_builder import steer_user_row
             from agent.session_persistence import _persist_lock, _db_flush_row
             with _persist_lock(agent):
+                _steer_uid = getattr(agent, "_pending_steer_uid", None)
+                if not _steer_uid:
+                    from agent.message_metadata import mint_uid
+                    _steer_uid = mint_uid()
+                    try: agent._pending_steer_uid = _steer_uid
+                    except Exception: pass
                 _steer_row = steer_user_row(steer_text)
+                if _steer_uid:
+                    _steer_row["message_uid"] = _steer_uid
                 _db.append_messages_batch(
                     session_id=agent.session_id,
                     messages=[_db_flush_row(agent, _steer_row, is_current_turn_user=False)],
@@ -1279,7 +1287,8 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
                     turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
                     turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
                 )
-                setattr(agent, "_steer_durably_persisted", True)
+                agent._steer_durably_persisted = True
+                agent._steer_durable_uid = _steer_uid
     except Exception:
         logger.exception("[api_server] accept-time steer persist failed (best-effort)")
     _mark_run_event(self, run_id, "run.steered", accepted=True)

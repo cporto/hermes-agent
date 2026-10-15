@@ -190,9 +190,9 @@ def prepare_iteration(
     # standalone user row after the newest tool result (never smeared onto the tool row: that
     # row is already persisted append-only, so replay would diverge from the live request and
     # break the prompt cache — same contract as apply_pending_steer_to_tool_results).
-    _pre_api_steer = agent._drain_pending_steer()
+    _pre_api_steer, _pre_api_steer_uid = agent._drain_pending_steer()
     if _pre_api_steer:
-        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
+        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer, _pre_api_steer_uid)
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
@@ -295,7 +295,7 @@ def _previous_tool_round(messages: Any) -> list:
     return []
 
 
-def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
+def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str, steer_uid=None) -> None:
     """Append the steer marker as a standalone user row after the newest tool message; with no
     tool message, put the text back so the post-tool-execution drain delivers it later."""
     for _si in range(len(messages) - 1, -1, -1):
@@ -304,17 +304,19 @@ def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text
             from agent.prompt_builder import steer_user_row
             from agent.context_compressor import _DB_PERSISTED_MARKER
             _row = steer_user_row(steer_text)
+            if steer_uid:
+                _row["message_uid"] = steer_uid
             # The accept-time persist may have already written this steer durably as
             # a display_kind=steer row; stamp the LIVE row so the next flush does NOT
             # write a second durable copy (exactly one steer row in the transcript).
             if getattr(agent, "_steer_durably_persisted", False):
                 _row[_DB_PERSISTED_MARKER] = True
-                setattr(agent, "_steer_durably_persisted", False)
+                agent._steer_durably_persisted = False
             messages.insert(_si + 1, _row)
             logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
             return
     from agent.agent_runtime_helpers import _requeue_pending_steer
-    _requeue_pending_steer(agent, steer_text)
+    _requeue_pending_steer(agent, steer_text, steer_uid)
 
 
 @dataclass

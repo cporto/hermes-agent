@@ -9,6 +9,7 @@ import threading
 from typing import Optional
 
 from agent.interrupt_compat import request_hard_interrupt
+from agent.message_metadata import mint_uid
 from tools.interrupt import request_yield as _request_yield
 from tools.interrupt import set_interrupt as _set_interrupt
 
@@ -262,6 +263,7 @@ class InterruptControlMixin:
             # hard_cancel, so a soft clear dropped a live user message with no trace.
             with _ic_lock(self, "_pending_steer_lock"):
                 self._pending_steer = None
+                self._pending_steer_uid = None
         return True
 
     def steer(self, text: str) -> bool:
@@ -273,6 +275,9 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            _cur_uid = _ic_slot(self, "_pending_steer_lock", "_pending_steer_uid")
+            if not _cur_uid:
+                self._pending_steer_uid = mint_uid()
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
         self._turn_user_intervened = True
         return True
@@ -352,9 +357,14 @@ class InterruptControlMixin:
             self._pending_redirect = None
         return text
 
-    def _drain_pending_steer(self) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot; None when nothing is pending."""
+    def _drain_pending_steer(self):
+        """Return ``(text, uid)`` for the pending steer (if any), clear both slots; ``(None, None)`` when
+        nothing is pending."""
         with _ic_lock(self, "_pending_steer_lock"):
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+            uid = _ic_slot(self, "_pending_steer_lock", "_pending_steer_uid")
             self._pending_steer = None
-        return text
+            self._pending_steer_uid = None
+        if not text:
+            return None, None
+        return text, uid

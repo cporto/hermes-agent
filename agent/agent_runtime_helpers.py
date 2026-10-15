@@ -3738,8 +3738,11 @@ def extract_api_error_context(error: Exception) -> dict[str, Any]:
     return context
 
 
-def _requeue_pending_steer(agent, steer_text: str) -> None:
+def _requeue_pending_steer(agent, steer_text: str, steer_uid: Optional[str] = None) -> None:
     """Put drained steer text back so the caller's fallback delivers it as a next-turn user message."""
+    # ``steer_uid`` (the uid drained alongside the text) is preserved so a requeue-and-redrain keeps the
+    # SAME logical steer uid instead of minting a fresh one; when absent the slot is left untouched and
+    # the next ``steer()``/drain path mints its own.
     # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
     # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
     # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
@@ -3750,9 +3753,13 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
                 agent._pending_steer = agent._pending_steer + "\n" + steer_text
             else:
                 agent._pending_steer = steer_text
+            if steer_uid:
+                agent._pending_steer_uid = steer_uid
     else:
         existing = getattr(agent, "_pending_steer", None)
         agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+        if steer_uid:
+            agent._pending_steer_uid = steer_uid
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
@@ -3777,7 +3784,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
-    steer_text = agent._drain_pending_steer()
+    steer_text, steer_uid = agent._drain_pending_steer()
     if not steer_text:
         return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
@@ -3787,9 +3794,11 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # No tool result in this batch (e.g. all skipped by interrupt);
         # requeue so the fallback path delivers it as a normal next-turn
         # user message (which persists like any other user turn).
-        _requeue_pending_steer(agent, steer_text)
+        _requeue_pending_steer(agent, steer_text, steer_uid)
         return
     _steer_row = steer_user_row(steer_text)
+    if steer_uid:
+        _steer_row["message_uid"] = steer_uid
     # If the accept-time durable persist already wrote this steer (display_kind=steer
     # row in the transcript), stamp the LIVE row so the next flush writes no second
     # copy — the transcript keeps exactly one steer row. This is the tool-batch drain
@@ -3797,7 +3806,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     if getattr(agent, "_steer_durably_persisted", False):
         from agent.context_compressor import _DB_PERSISTED_MARKER
         _steer_row[_DB_PERSISTED_MARKER] = True
-        setattr(agent, "_steer_durably_persisted", False)
+        agent._steer_durably_persisted = False
     messages.append(_steer_row)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
