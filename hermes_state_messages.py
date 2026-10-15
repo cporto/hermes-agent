@@ -984,6 +984,14 @@ class SessionMessagesMixin:
         # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
         # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
         self._carry_parent_timestamps(conn, session_id, compacted_messages)
+        # R2: a carried steer is a verbatim-carry HUMAN turn that must NOT be re-inserted as a second
+        # active row. The original steer row (restored active above) is its only durable copy; the carry
+        # exists only to keep it in model context, not to add a row. Drop steer dicts from the insert set.
+        if compacted_messages:
+            compacted_messages = [
+                m for m in compacted_messages
+                if not (isinstance(m, dict) and m.get("display_kind") == "steer")
+            ]
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
         if unseen:
             _ids, unseen_tool_calls = self._tail_rows_after_watermark(
@@ -1052,6 +1060,12 @@ class SessionMessagesMixin:
             tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
                 (session_id, int(watermark)))
+            # A2: steers are ONE logical row per (session_id, message_uid); never rewind/clone a steer so
+            # a concurrent steer is not duplicated, and never let the archive sweep remove its active copy.
+            steer_ids = {int(r["id"]) for r in conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND display_kind = 'steer' AND active = 1",
+                (session_id,))}
+            tail_ids = [t for t in tail_ids if t not in steer_ids]
             # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
             # concurrent append would steal a LIMIT slot.
             rewind_ids: list[int] = self._resolve_carried_row_ids(
@@ -1065,6 +1079,7 @@ class SessionMessagesMixin:
                      int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
             rewind_ids += tail_ids
             rewind_ids = list(dict.fromkeys(rewind_ids))
+            rewind_ids = [rid for rid in rewind_ids if rid not in steer_ids]
             if rewind_ids:
                 placeholders = _placeholders(rewind_ids)
                 conn.execute("UPDATE messages SET active = 0, compacted = 0 "
@@ -1072,6 +1087,13 @@ class SessionMessagesMixin:
                 conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({placeholders})", [session_id, *rewind_ids])
             else:
                 conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
+            # A2: restore exempted steer rows (same id, active=1, compacted=0) after the archive sweep so
+            # a steer stays exactly one active row even at/below the watermark.
+            if steer_ids:
+                _ph = _placeholders(sorted(steer_ids))
+                conn.execute(
+                    f"UPDATE messages SET active = 1, compacted = 0 WHERE id IN ({_ph}) AND display_kind = 'steer'",
+                    [*sorted(steer_ids)])
             # Same identity carry as publish_compression_child (#59661): carried tail copies keep the
             # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
             # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
