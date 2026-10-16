@@ -599,7 +599,39 @@ class SessionPortabilityMixin:
         clean_messages: list[dict[str, Any]] = []
         for message_index, message in enumerate(messages):
             clean_messages.append(self._normalize_import_message(message, message_index))
+        # Imports do NOT carry message_uid (added fresh at INSERT), so same-donor duplicate steer
+        # rows — e.g. a donor that pre-dates the durable-uid fix — would import as distinct active
+        # steers and bypass the write-side dedupe/unique-index collapse. Normalize them HERE by
+        # logical identity (content + timestamp), keeping the newest active row and dropping
+        # duplicate steers, so the post-import invariant (one active steer per logical steer) holds.
+        clean_messages = self._collate_duplicate_import_steers(clean_messages)
         return {"session": clean_session, "messages": clean_messages}
+
+    @staticmethod
+    def _collate_duplicate_import_steers(clean_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop duplicate display_kind='steer' messages with the same content+timestamp, keeping the
+        last (newest) occurrence; non-steer rows are passed through untouched and order is preserved.
+
+        The durable-uid write path never emits two active steers with the same content+timestamp for
+        one logical steer, so a same-key steer here can only be a donor-side duplicate (or a mass
+        re-import of the same session) that must collapse to one row. Content is compared byte-for-byte
+        after stripping; timestamp is compared as a float (import already coerced/validated it)."""
+        seen: dict[tuple, int] = {}  # key -> last index to keep
+        for index, msg in enumerate(clean_messages):
+            if msg.get("display_kind") != "steer":
+                continue
+            content = msg.get("content")
+            content_key = content.strip() if isinstance(content, str) else content
+            timestamp_key = msg.get("timestamp")
+            try:
+                timestamp_key = float(timestamp_key) if timestamp_key is not None else None
+            except (TypeError, ValueError):
+                pass
+            seen[(content_key, timestamp_key)] = index
+        if not seen:
+            return clean_messages
+        keep = {index for index in seen.values()}
+        return [msg for index, msg in enumerate(clean_messages) if msg.get("display_kind") != "steer" or index in keep]
 
     def _validate_import_payload(self, sessions: list[dict[str, Any]]) -> tuple:
         """Size/shape/type validation of the whole payload; returns ``(normalized_items,
