@@ -264,6 +264,12 @@ class InterruptControlMixin:
             with _ic_lock(self, "_pending_steer_lock"):
                 self._pending_steer = None
                 self._pending_steer_uid = None
+                # Flag leak (review A, attack B): hard_cancel drops the pending steer slots
+                # but NOT _steer_durably_persisted, so a stale True made the NEXT steer get
+                # marker-stamped and skipped by flush — never durably written, even via the
+                # API accept path. Reset it (and the durable uid) alongside the slot wipe.
+                self._steer_durably_persisted = False
+                self._steer_durable_uid = None
         return True
 
     def steer(self, text: str) -> bool:
@@ -280,7 +286,56 @@ class InterruptControlMixin:
                 self._pending_steer_uid = mint_uid()
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
         self._turn_user_intervened = True
+        # R4 + multi-steer: persist the steer DURABLY at accept time, here in steer() itself so
+        # EVERY steering surface (API route, TUI/desktop, kanban, CLI) gets the crash-safe write —
+        # not just the API route that historically did it inline. Best-effort: a failure here is
+        # non-fatal (the steer stays queued and the normal drain/finalizer path still delivers it).
+        self._persist_pending_steer_durably()
         return True
+
+    def _persist_pending_steer_durably(self) -> None:
+        """Best-effort accept-time durable write of the pending steer (``_pending_steer`` + its stable
+        ``message_uid``), keyed by uid so a second /steer in the same turn EXTENDS the durable text
+        instead of being deduped away (multi-steer loss). Guarded on ``_session_db``. Never raises.
+        The drain/finalizer sites stamp ``_DB_PERSISTED_MARKER`` when this flag is set, so the
+        transcript holds EXACTLY ONE steer row — this write is the durable copy, the live row is not."""
+        try:
+            _db = getattr(self, "_session_db", None)
+            if _db is None:
+                return
+            with _ic_lock(self, "_pending_steer_lock"):
+                _text = getattr(self, "_pending_steer", None)
+                _uid = getattr(self, "_pending_steer_uid", None)
+            if not _text or not _uid:
+                return
+            _sid = getattr(self, "session_id", None)
+            if not _sid:
+                return
+            from agent.prompt_builder import steer_user_row
+            from agent.session_persistence import _persist_lock, _db_flush_row
+            with _persist_lock(self):
+                _existing = _db._read_one(
+                    "SELECT id FROM messages WHERE session_id = ? AND display_kind = 'steer' "
+                    "AND message_uid = ? AND active = 1",
+                    (_sid, _uid))
+                _row = steer_user_row(_text)
+                _row["message_uid"] = _uid
+                if _existing is not None:
+                    # Same logical steer already durable: update its content to the full concatenated
+                    # text (a second /steer extended _pending_steer). role='user' via set_user_message_content.
+                    _db.set_user_message_content(_sid, int(_existing["id"]), _row["content"])
+                else:
+                    _db.append_messages_batch(
+                        session_id=_sid,
+                        messages=[_db_flush_row(self, _row, is_current_turn_user=False)],
+                        compression_lock_holder=getattr(self, "_active_compression_lock_holder", None),
+                        turn_lease_holder=getattr(self, "_active_session_turn_lease_holder", None),
+                        turn_lease_ttl_seconds=getattr(self, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+                    )
+                self._steer_durably_persisted = True
+                self._steer_durable_uid = _uid
+        except Exception:
+            logger.exception("[agent] accept-time steer persist failed (best-effort)")
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task: during a model request only that

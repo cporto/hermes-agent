@@ -546,6 +546,12 @@ _CONTROL_STATE: dict[str, Any] = {
     "_pending_steer": None,
     "_pending_steer_uid": None,  # one stable message_uid per logical steer, minted in steer()
     "_pending_steer_lock": threading.Lock,
+    # Durable accept-time steer persistence (for /steer across every surface). _steer_durably_persisted
+    # is True once the accept write landed; the drain/finalizer stamp _DB_PERSISTED_MARKER and reset it.
+    # _steer_durable_uid is the uid of that durable row. Both are reset together with the pending slots
+    # on hard_cancel so a stale flag can never poison the next steer (flag leak).
+    "_steer_durably_persisted": False,
+    "_steer_durable_uid": None,
     # Active-turn redirect: keep the valid turn prefix, cancel only the in-flight request,
     # rebuild the tail with the correction. Drained at a role-safe boundary.
     "_pending_redirect": None,

@@ -1246,51 +1246,13 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
     if not accepted:
         return _json_error(
             _openai_error, f"Run did not accept steer text: {run_id}", code="steer_not_accepted", status=409)
-    # Persist the steer DURABLY at accept time (best-effort). agent.steer() above
-    # only QUEUED the text into _pending_steer; both later drain sites write the
-    # durable row only on a subsequent flush/finalize, which a hard interrupt
-    # (SSE disconnect) can skip — so an accepted steer was previously lost from
-    # the transcript on 'phone off + return'. Writing here survives any interrupt.
-    # Alt/dupe control: persist UNCONDITIONALLY at accept. A steer can land while
-    # the transcript tail is the user's OWN message (the assistant reply is still
-    # streaming and unsaved) — that is the normal steering window, so a tail-role
-    # guard must NOT gate the durable write or the nudge is lost on disconnect.
-    # The durable user;user wedge this can create is healed at READ time by the
-    # existing repair chain (repair_alternation -> repair_message_sequence ->
-    # _merge_consecutive_users, per gateway/session_transcript.py 'heal a durable
-    # user;user wedge once here'); the steer text survives, never dropped. The
-    # accept write goes to SQLite only (append_messages_batch), never the live
-    # request, so no user;user is ever sent to a provider mid-run. The agent-loop
-    # drain sites stamp _DB_PERSISTED_MARKER on the live row (and the finalizer
-    # skips) once this accept made it durable, so the transcript holds EXACTLY ONE
-    # steer row. A failure here is non-fatal: the steer stays queued and the normal
-    # drain path still delivers/actions it.
-    try:
-        _db = getattr(agent, "_session_db", None)
-        if _db is not None:
-            from agent.prompt_builder import steer_user_row
-            from agent.session_persistence import _persist_lock, _db_flush_row
-            with _persist_lock(agent):
-                _steer_uid = getattr(agent, "_pending_steer_uid", None)
-                if not _steer_uid:
-                    from agent.message_metadata import mint_uid
-                    _steer_uid = mint_uid()
-                    try: agent._pending_steer_uid = _steer_uid
-                    except Exception: pass
-                _steer_row = steer_user_row(steer_text)
-                if _steer_uid:
-                    _steer_row["message_uid"] = _steer_uid
-                _db.append_messages_batch(
-                    session_id=agent.session_id,
-                    messages=[_db_flush_row(agent, _steer_row, is_current_turn_user=False)],
-                    compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
-                    turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
-                    turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
-                )
-                agent._steer_durably_persisted = True
-                agent._steer_durable_uid = _steer_uid
-    except Exception:
-        logger.exception("[api_server] accept-time steer persist failed (best-effort)")
+    # Persist the steer DURABLY at accept time (best-effort). This now happens inside
+    # agent.steer() itself (agent._persist_pending_steer_durably), so EVERY steering
+    # surface (API route, TUI/desktop, kanban, CLI) gets the crash-safe accept write,
+    # not just this route. The reasoning above still holds: a hard interrupt (SSE
+    # disconnect) can skip both drain sites, so the durable write must land at accept.
+    # agent._persist_pending_steer_durably handles uid minting, the multi-steer
+    # update-by-uid case, and the user;user-wedge note (healed at READ time).
     _mark_run_event(self, run_id, "run.steered", accepted=True)
     return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
