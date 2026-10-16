@@ -275,7 +275,7 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-            _cur_uid = _ic_slot(self, "_pending_steer_lock", "_pending_steer_uid")
+            _cur_uid = getattr(self, "_pending_steer_uid", None)
             if not _cur_uid:
                 self._pending_steer_uid = mint_uid()
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
@@ -362,7 +362,7 @@ class InterruptControlMixin:
         nothing is pending."""
         with _ic_lock(self, "_pending_steer_lock"):
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            uid = _ic_slot(self, "_pending_steer_lock", "_pending_steer_uid")
+            uid = getattr(self, "_pending_steer_uid", None)
             self._pending_steer = None
             self._pending_steer_uid = None
         if not text:
