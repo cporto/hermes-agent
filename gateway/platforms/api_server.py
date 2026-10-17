@@ -3285,7 +3285,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         content_type = request.headers.get("Content-Type", "") or "application/octet-stream"
         safe_name = _sanitize_upload_base(filename)
         try:
-            data = await request.content.read(_FILES_UPLOAD_MAX_BYTES + 1)
+            # await request.read() reads the ENTIRE body (blocks until EOF) and honors the
+            # app's client_max_size (= MAX_REQUEST_BYTES, 10 MB): it both waits for the full
+            # payload and raises web.HTTPRequestEntityTooLarge above the cap. A single
+            # request.content.read(n) returns a short read on this aiohttp runtime, which was
+            # silently truncating uploads (client got it, file written short). This is the fix.
+            data = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            return _error_response("File exceeds the 10 MB upload cap.", 413, code="files_too_large")
         except Exception:
             return _error_response("Failed to read request body.", 400)
         if len(data) > _FILES_UPLOAD_MAX_BYTES:
