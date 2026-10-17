@@ -3609,6 +3609,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             store = getattr(runner, "session_store", None)
             if store is not None:
                 await asyncio.to_thread(store.remove_by_session_id, session_id)
+            # A deleted session mid-clarify would otherwise pin the agent worker thread on the
+            # pending entry until its clarify timeout (3600s). Drop those entries so the blocked
+            # clarify_callback unblocks (CANCELLED -> outcome "cancelled") immediately. Entries
+            # register under gateway_session_key (if set) else session_id, so clear both.
+            from tools import clarify_gateway as clarify_mod
+            gateway_key, _ = self._parse_session_key_header(request)
+            for key in {session_id, gateway_key}:
+                if key:
+                    clarify_mod.clear_session(key)
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     @_require_auth
@@ -3824,8 +3833,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if not isinstance(response, str):
             return _error_response("response must be a string", 400, code="invalid_clarify_response")
         try:
-            from tools.clarify_gateway import resolve_gateway_clarify
-            resolved = await asyncio.to_thread(resolve_gateway_clarify, clarify_id, response)
+            from tools.clarify_gateway import resolve_gateway_clarify_skip_aware
+            resolved = await asyncio.to_thread(resolve_gateway_clarify_skip_aware, clarify_id, response)
         except Exception as exc:
             return _error_response(_redact_api_error_text(exc), 500, code="clarify_resolve_failed")
         if not resolved:

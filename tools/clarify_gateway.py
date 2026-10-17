@@ -101,6 +101,24 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
         return True
 
 
+def resolve_gateway_clarify_skip_aware(clarify_id: str, response: str) -> bool:
+    """Like :func:`resolve_gateway_clarify`, but honors a literal ``SKIP_WORD`` reply
+    ("skip") by recording the ``SKIPPED`` sentinel. The api_server POST /clarify bridge
+    bypasses the native text-intercept that normally enforces SKIP_WORD, so a client that
+    sends "skip" here would otherwise be stored as a literal answered value; this restores
+    skip semantics. Non-skip replies are stored verbatim (unchanged behaviour)."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.event.is_set():
+            return False
+        if str(response).strip().casefold() == SKIP_WORD:
+            entry.response = SKIPPED
+        else:
+            entry.response = str(response) if response is not None else ""
+        entry.event.set()
+        return True
+
+
 def get_pending_for_session(session_key: str, *, include_choice_prompts: bool = False) -> Optional[_ClarifyEntry]:
     """Oldest pending entry awaiting free text (open-ended, or after "Other");
     ``include_choice_prompts=True`` returns the oldest unresolved entry of any kind (user

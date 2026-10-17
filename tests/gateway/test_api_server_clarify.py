@@ -105,3 +105,92 @@ async def test_clarify_resolve_route_unblocks_waiter_and_fails_closed():
                 pass
         await adapter.disconnect()
         adapter._site = None  # allow a second connect in the same process if reused
+
+
+@pytest.mark.asyncio
+async def test_clarify_literal_skip_is_honored_not_answered():
+    """C2: a literal "skip" reply on POST /clarify must come back as the SKIPPED
+    sentinel (so the tool sees a skip), not be stored as a literal answered value."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+        "host": "127.0.0.1", "port": 0, "key": "test-clarify-key",
+    }))
+    assert await adapter.connect()
+    session_id = None
+    clarify_id = "clr_skip_test_1"
+    try:
+        port = adapter._site._server.sockets[0].getsockname()[1]
+        async with ClientSession() as client:
+            session_id = await _create_session(client, port, "test-clarify-key")
+            clarify_mod.register(
+                clarify_id=clarify_id, session_key=session_id,
+                question="Which environment?", choices=["staging", "prod"],
+            )
+            result_box: dict = {}
+            waiter = threading.Thread(
+                target=lambda: result_box.update(
+                    result=clarify_mod.wait_for_response(clarify_id, timeout=10)))
+            waiter.start()
+
+            async with client.post(
+                f"http://127.0.0.1:{port}/api/sessions/{session_id}/clarify",
+                headers={**_auth("test-clarify-key"), "Content-Type": "application/json"},
+                json={"clarify_id": clarify_id, "response": "skip"},
+            ) as response:
+                assert response.status == 200, await response.text()
+                assert (await response.json()).get("resolved") is True
+
+            waiter.join(timeout=15)
+            assert not waiter.is_alive(), "waiter did not unblock after skip"
+            assert result_box.get("result") == clarify_mod.SKIPPED
+    finally:
+        clarify_mod.clear_session(session_id or "")
+        if session_id:
+            port = adapter._site._server.sockets[0].getsockname()[1]
+            async with ClientSession() as client:
+                async with client.delete(
+                    f"http://127.0.0.1:{port}/api/sessions/{session_id}",
+                    headers=_auth("test-clarify-key"),
+                ) as response:
+                    response.status
+        await adapter.disconnect()
+        adapter._site = None
+
+
+@pytest.mark.asyncio
+async def test_delete_session_clears_pending_clarify():
+    """C1: deleting a session that has a pending clarify must unblock the blocked
+    waiter (CANCELLED) instead of pinning it until the 3600s timeout."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+        "host": "127.0.0.1", "port": 0, "key": "test-clarify-key",
+    }))
+    assert await adapter.connect()
+    session_id = None
+    clarify_id = "clr_delete_test_1"
+    try:
+        port = adapter._site._server.sockets[0].getsockname()[1]
+        async with ClientSession() as client:
+            session_id = await _create_session(client, port, "test-clarify-key")
+            clarify_mod.register(
+                clarify_id=clarify_id, session_key=session_id,
+                question="Pick one", choices=["a", "b"],
+            )
+            result_box: dict = {}
+            waiter = threading.Thread(
+                target=lambda: result_box.update(
+                    result=clarify_mod.wait_for_response(clarify_id, timeout=10)))
+            waiter.start()
+
+            async with client.delete(
+                f"http://127.0.0.1:{port}/api/sessions/{session_id}",
+                headers=_auth("test-clarify-key"),
+            ) as response:
+                assert response.status == 200, await response.text()
+                assert (await response.json()).get("deleted") is True
+
+            waiter.join(timeout=15)
+            assert not waiter.is_alive(), "waiter did not unblock on session delete"
+            assert result_box.get("result") == clarify_mod.CANCELLED
+    finally:
+        clarify_mod.clear_session(session_id or "")
+        await adapter.disconnect()
+        adapter._site = None
