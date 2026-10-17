@@ -1141,8 +1141,12 @@ def _sanitize_upload_base(filename: str) -> str:
     name = os.path.basename((filename or "").replace("\\", "/")).strip()
     if not name:
         return "file"
-    name = re.sub(r"[^A-Za-z0-9._\-]", "_", name)
-    name = name[:100].strip("._")
+    # Deny check on the raw-ish name BEFORE dot-stripping so ".env" is still caught.
+    pre = re.sub(r"[^A-Za-z0-9._\-]", "_", name)[:100]
+    if any(fnmatch.fnmatch(pre, pat) for pat in _FILES_DENY_NAMES):
+        stem = pre.split(".")[0].strip("._") or "file"
+        return f"{stem}.bin"
+    name = pre.strip("._")
     if not name:
         return "file"
     stem, dot, ext = name.rpartition(".")
@@ -1151,9 +1155,6 @@ def _sanitize_upload_base(filename: str) -> str:
     stem_ok = stem or "file"
     ext_l = ext.lower()
     if dot and (ext_l in _FILES_ACTIVE_EXTS or not re.fullmatch(r"[a-z0-9]{1,10}", ext_l)):
-        return f"{stem_ok}.bin"
-    # Refuse any slug the shared download deny-list would refuse.
-    if any(fnmatch.fnmatch(name, pat) for pat in _FILES_DENY_NAMES):
         return f"{stem_ok}.bin"
     return name
 
@@ -3291,7 +3292,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response("File exceeds the 10 MB upload cap.", 413, code="files_too_large")
         if not data:
             return _error_response("Empty request body.", 400)
-        uid = hashlib.sha256(data).hexdigest()[:16]
+        uid = hashlib.sha256(data).hexdigest()[:16] + os.urandom(3).hex()
         on_disk = f"{uid}_{safe_name}"
 
         def _write() -> str:
