@@ -9,6 +9,7 @@ OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_
 import asyncio
 import concurrent.futures
 import errno
+import fnmatch
 import hashlib
 import hmac
 import itertools
@@ -20,6 +21,7 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -99,7 +101,9 @@ _CAPABILITY_ENDPOINTS = (
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
-    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")))
+    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")),
+("files_download", ("GET", "/v1/files")),
+)
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
 
@@ -982,6 +986,119 @@ def _invalid_request(message: str) -> web.Response:
     return web.json_response({"error": {"message": message, "type": "invalid_request_error"}}, status=400)
 
 
+# ---------------------------------------------------------------------------
+# GET /v1/files — path-based, allowlist-rooted file download.
+#
+# Allowlist roots are ABSOLUTE paths resolved from the runtime $HOME at startup
+# (never hardcoded /home/... guesses). Every check runs against the canonical
+# (symlink-resolved) path. We reject `..` components, a raw backslash, control
+# bytes, non-absolute input, and URL-encoded traversal tokens (%2e / %2f / %5c)
+# on the RAW query string — we never "decode then hope". Only regular, non-hardlink
+# files under an allowed root and off the deny-list are served, always as
+# `Content-Disposition: attachment` + `X-Content-Type-Options: nosniff` (never
+# inline, so agent/uploaded HTML or SVG can't script). Errors never echo the path.
+_FILES_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _files_roots() -> list[str]:
+    """Absolute allowlist roots, resolved once from the runtime $HOME."""
+    home = os.path.expanduser("~")
+    raw = [
+        os.path.join(home, "Projects"),
+        os.path.join(home, "workspace"),
+        os.path.join(home, ".hermes"),
+        os.path.join(home, ".hermes", "cache", "scratch"),
+        os.path.join(home, "Downloads"),
+        "/tmp",
+    ]
+    return [os.path.realpath(r) for r in raw]
+
+
+def _files_deny_dirs() -> list[str]:
+    """Absolute directories that are never served even though they sit under an allowed root."""
+    home = os.path.expanduser("~")
+    gateway_dir = os.path.realpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return [
+        os.path.realpath(os.path.join(home, ".ssh")),
+        os.path.realpath(os.path.join(home, ".hermes", "keys")),
+        gateway_dir,
+    ]
+
+
+# Any path segment matching one of these (e.g. `.git`) denies the whole path.
+_FILES_DENY_SEGMENTS = (".git",)
+# Leaf-name patterns that are never served even inside an allowed root.
+_FILES_DENY_NAMES = (
+    ".env", ".env.*", "*.pem", "*.key", "id_rsa", "id_ed25519",
+    "known_hosts", "authorized_keys", "API_SERVER_KEY", "state.db",
+    "*.sqlite*", "package-lock.json", "config.yaml", "config.yml",
+)
+
+
+def _validate_allowlist_path(raw_path: str) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(canonical_allowed_path, None)`` if safe to serve, else ``(None, deny_reason)``."""
+    if not raw_path:
+        return None, "missing_path"
+    if "\x00" in raw_path or any(ord(c) < 32 for c in raw_path):
+        return None, "bad_path"
+    if "\\" in raw_path:
+        return None, "backslash"
+    expanded = os.path.expanduser(raw_path)
+    if not os.path.isabs(expanded):
+        return None, "not_absolute"
+    if any(part == ".." for part in expanded.replace("\\", "/").split("/")):
+        return None, "traversal"
+    canonical = os.path.realpath(expanded)
+    for deny_dir in _files_deny_dirs():
+        if canonical == deny_dir or canonical.startswith(deny_dir + os.sep):
+            return None, "denied"
+    allowed = False
+    for root in _files_roots():
+        if canonical == root or canonical.startswith(root + os.sep):
+            allowed = True
+            break
+    if not allowed:
+        return None, "not_allowed"
+    parts = canonical.split(os.sep)
+    if any(seg in _FILES_DENY_SEGMENTS for seg in parts):
+        return None, "denied"
+    leaf = parts[-1] if parts else canonical
+    if any(fnmatch.fnmatch(leaf, pat) for pat in _FILES_DENY_NAMES):
+        return None, "denied"
+    try:
+        st = os.stat(canonical)
+    except FileNotFoundError:
+        return None, "not_found"
+    except OSError:
+        return None, "read_error"
+    if not stat.S_ISREG(st.st_mode):
+        return None, "not_a_file"
+    if st.st_nlink != 1:
+        return None, "hardlink"
+    if st.st_size > _FILES_MAX_BYTES:
+        return None, "too_large"
+    return canonical, None
+
+
+def _files_deny_response(reason: str) -> web.Response:
+    """Map a validator deny reason to a safe, generic HTTP response (resolved path is never echoed)."""
+    status = {
+        "not_found": 404,
+        "missing_path": 400,
+        "not_absolute": 400,
+        "traversal": 400,
+        "bad_path": 400,
+        "backslash": 400,
+        "too_large": 413,
+        "not_a_file": 403,
+        "denied": 403,
+        "not_allowed": 403,
+        "hardlink": 403,
+        "read_error": 403,
+    }.get(reason, 403)
+    return _error_response("Requested file is not available.", status, code="files_denied")
+
+
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None)
 
@@ -1819,6 +1936,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/browser-control/ws", self._handle_browser_control_ws),
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
+            ("GET", "/v1/files", self._handle_files_download),
             ("GET", "/v1/widgets", self._handle_widgets),
             ("GET", "/v1/widgets/{widget_id}", self._handle_widget),
             ("GET", "/v1/skills", self._handle_skills),
@@ -3027,6 +3145,67 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             body=data, status=200, content_type=receipt.content_type,
             headers={"X-Artifact-Sha256": receipt.sha256, "X-Artifact-Id": receipt.artifact_id,
                      "Content-Disposition": f'attachment; filename="{receipt.filename}"'})
+
+    @_require_auth
+    async def _handle_files_download(self, request: web.Request) -> web.StreamResponse:
+        """GET /v1/files?path=<allowlist-rooted absolute path> — repeatable path-based download.
+
+        Re-reads the file on every request (live-read semantics). Ladder: 403 no API key,
+        401 bad Bearer, 429 rate limited, 400 bad path / traversal, 404 not found, 403 not
+        allowed / not a regular file, 413 too large, 200 attachment stream. Serves only
+        regular, non-hardlink files under an allowlist root and off the deny-list; always
+        ``Content-Disposition: attachment`` + ``nosniff``; never echoes the resolved path.
+        """
+        _ctx, err = self._artifact_route_prelude(request, "files", check_enabled=False)
+        if err is not None:
+            return err
+        # Reject URL-encoded traversal tokens on the RAW query string — reject raw, never
+        # "decode then hope".
+        if re.search(r"%2e|%2f|%5c", request.query_string, flags=re.IGNORECASE):
+            return _error_response("Invalid path.", 400, code="files_bad_path")
+        paths = request.query.getall("path", [])
+        if len(paths) != 1 or not paths[0].strip():
+            return _error_response("A single 'path' query parameter is required.", 400, code="files_bad_path")
+        canonical, reason = _validate_allowlist_path(paths[0].strip())
+        if canonical is None:
+            return _files_deny_response(reason)
+        # Open with O_NOFOLLOW on the final component, then validate the *opened* fd
+        # (regular file, st_nlink == 1, size cap, inode == canonical) — closes the
+        # check-then-open TOCTOU window (no openat2 on the runtime Python).
+        try:
+            fd = os.open(canonical, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            return _error_response("File not found.", 404, code="files_not_found")
+        except OSError:
+            return _error_response("File not available.", 403, code="files_denied")
+        try:
+            st = os.fstat(fd)
+            ok = stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_size <= _FILES_MAX_BYTES
+            if ok:
+                head = os.stat(canonical)
+                ok = (st.st_dev, st.st_ino) == (head.st_dev, head.st_ino)
+        except OSError:
+            ok = False
+        if not ok:
+            os.close(fd)
+            return _files_deny_response("denied")
+        safe_name = os.path.basename(canonical).replace('"', "_")[:128]
+        resp = web.StreamResponse(status=200, headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "X-Content-Type-Options": "nosniff",
+        })
+        resp.content_length = st.st_size
+        await resp.prepare(request)
+        try:
+            while True:
+                chunk = os.read(fd, 64 * 1024)
+                if not chunk:
+                    break
+                await resp.write(chunk)
+        finally:
+            os.close(fd)
+        return resp
 
     @_require_auth
     async def _handle_skills(self, request: web.Request) -> web.Response:
