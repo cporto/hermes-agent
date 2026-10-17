@@ -102,7 +102,8 @@ _CAPABILITY_ENDPOINTS = (
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
     ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")),
-("files_download", ("GET", "/v1/files")),
+    ("files_download", ("GET", "/v1/files")),
+    ("files_upload", ("POST", "/v1/files")),
 )
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
@@ -1099,6 +1100,64 @@ def _files_deny_response(reason: str) -> web.Response:
     return _error_response("Requested file is not available.", status, code="files_denied")
 
 
+# ---------------------------------------------------------------------------
+# POST /v1/files — bounded raw upload into a dedicated private upload root.
+#
+# Shares the download route's allowlist/deny primitives (single source of truth)
+# so an uploaded name is ALWAYS servable by GET /v1/files without a dead 403 card.
+# The client filename is DISPLAY metadata only — never a path component. The
+# on-disk name is server-minted `<hexid>_<safe_name>`; the safe_name is a
+# sanitized slug whose extension survives only if it is not deny-listed and not
+# an active (scriptable) type, otherwise the file is stored as `.bin`.
+_FILES_UPLOAD_MAX_BYTES = 10 * 1024 * 1024                 # inherit the global 10 MB body cap
+_FILES_UPLOAD_ROOT_TOTAL_BYTES = 4 * 1024 * 1024 * 1024    # 4 GB whole-root cap (disk-fill bound)
+_FILES_UPLOAD_TTL_SECONDS = 7 * 24 * 3600                  # reaper: purge uploads older than 7 days
+
+# Extension types treated as active/scriptable content -> always stored as `.bin`.
+_FILES_ACTIVE_EXTS = frozenset({
+    "html", "htm", "xhtml", "xht", "svg", "xml",
+    "js", "mjs", "cjs", "wasm", "exe", "dll", "com",
+    "sh", "bat", "cmd", "ps1", "vbs",
+})
+
+
+class _FilesUploadError(Exception):
+    def __init__(self, status: int, code: str):
+        super().__init__(code)
+        self.status = status
+        self.code = code
+
+
+def _files_upload_root() -> str:
+    """Dedicated, private upload root. Sits under the already-allowed `~/.hermes` download
+    root (so GET /v1/files serves it) but is a dedicated 0700 directory, not a shared one."""
+    return os.path.realpath(os.path.join(os.path.expanduser("~"), ".hermes", "uploads"))
+
+
+def _sanitize_upload_base(filename: str) -> str:
+    """Reduce a client display filename to a safe on-disk slug. No path separators, no control
+    bytes, bounded length, safe extension only; deny-listed or active names/exts -> `.bin`.
+    The caller prepends a server-minted id, so this is just the collision-safe slug."""
+    name = os.path.basename((filename or "").replace("\\", "/")).strip()
+    if not name:
+        return "file"
+    name = re.sub(r"[^A-Za-z0-9._\-]", "_", name)
+    name = name[:100].strip("._")
+    if not name:
+        return "file"
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    stem_ok = stem or "file"
+    ext_l = ext.lower()
+    if dot and (ext_l in _FILES_ACTIVE_EXTS or not re.fullmatch(r"[a-z0-9]{1,10}", ext_l)):
+        return f"{stem_ok}.bin"
+    # Refuse any slug the shared download deny-list would refuse.
+    if any(fnmatch.fnmatch(name, pat) for pat in _FILES_DENY_NAMES):
+        return f"{stem_ok}.bin"
+    return name
+
+
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None)
 
@@ -1937,6 +1996,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/files", self._handle_files_download),
+            ("POST", "/v1/files", self._handle_files_upload),
             ("GET", "/v1/widgets", self._handle_widgets),
             ("GET", "/v1/widgets/{widget_id}", self._handle_widget),
             ("GET", "/v1/skills", self._handle_skills),
@@ -3206,6 +3266,90 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         finally:
             os.close(fd)
         return resp
+
+    @_require_auth
+    async def _handle_files_upload(self, request: web.Request) -> web.Response:
+        """POST /v1/files — bounded raw upload into the dedicated ``~/.hermes/uploads`` root.
+
+        Reuses the download validator's allowlist/deny primitives so the returned absolute
+        path is always servable by GET /v1/files (never a dead 403 card). The client filename
+        (``X-File-Filename``) is display metadata only; the on-disk name is server-minted
+        ``<hexid>_<safe>``. Ladder: 403 no API key, 401 bad Bearer, 429 rate limited,
+        413 size cap, 507 quota, 400 bad request, 201 {path, name, size, mime}.
+        """
+        _ctx, err = self._artifact_route_prelude(request, "upload_f", check_enabled=False)
+        if err is not None:
+            return err
+        filename = request.headers.get("X-File-Filename", "").strip()
+        content_type = request.headers.get("Content-Type", "") or "application/octet-stream"
+        safe_name = _sanitize_upload_base(filename)
+        try:
+            data = await request.content.read(_FILES_UPLOAD_MAX_BYTES + 1)
+        except Exception:
+            return _error_response("Failed to read request body.", 400)
+        if len(data) > _FILES_UPLOAD_MAX_BYTES:
+            return _error_response("File exceeds the 10 MB upload cap.", 413, code="files_too_large")
+        if not data:
+            return _error_response("Empty request body.", 400)
+        uid = hashlib.sha256(data).hexdigest()[:16]
+        on_disk = f"{uid}_{safe_name}"
+
+        def _write() -> str:
+            root = _files_upload_root()
+            try:
+                os.makedirs(root, mode=0o700, exist_ok=True)
+            except OSError:
+                pass
+            # Whole-root quota + TTL reaper (bounds disk fill; per-principal quota is Phase-2).
+            now = time.time()
+            total = 0
+            try:
+                for entry in os.scandir(root):
+                    if entry.is_file(follow_symlinks=False):
+                        try:
+                            st = entry.stat()
+                            total += st.st_size
+                            if now - st.st_mtime > _FILES_UPLOAD_TTL_SECONDS:
+                                os.unlink(entry.path)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            if total + len(data) > _FILES_UPLOAD_ROOT_TOTAL_BYTES:
+                raise _FilesUploadError(507, "files_quota")
+            full = os.path.join(root, on_disk)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(full, flags, 0o600)
+            except FileExistsError:
+                raise _FilesUploadError(500, "files_write") from None
+            except OSError as exc:
+                raise _FilesUploadError(507, "files_write") from exc
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                st = os.stat(full)
+                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                    os.unlink(full)
+                    raise _FilesUploadError(500, "files_write")
+            except OSError as exc:
+                with suppress(OSError):
+                    os.unlink(full)
+                raise _FilesUploadError(500, "files_write") from exc
+            return full
+
+        try:
+            full = await asyncio.to_thread(_write)
+        except _FilesUploadError as exc:
+            return _error_response("Upload failed.", exc.status, code=exc.code)
+        return web.json_response({
+            "path": full,
+            "name": safe_name,
+            "size": len(data),
+            "mime": content_type,
+        }, status=201)
 
     @_require_auth
     async def _handle_skills(self, request: web.Request) -> web.Response:
