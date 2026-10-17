@@ -222,6 +222,13 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 _BIND_ATTEMPTS = 5  # EADDRINUSE retries while a restart's predecessor releases the port (#91547)
+# Deadline window (monotonic) spanning the TIME_WAIT interval (~2*MSL, 30-60s): a restart's
+# predecessor holds the port in TIME_WAIT for up to ~60s (#10297). The fixed attempt-count loop
+# gave up after a few hundred ms, so gateway restarts failed even though the port was about to
+# become rebindable. Keep the *inter-attempt* structure (per-attempt runner rebuild, EADDRINUSE
+# gating, non-retryable classification) but retry across a real monotonic deadline rather than a
+# fixed count.
+_BIND_DEADLINE_SECONDS = 45.0  # > 30s (2*MSL lower bound), covers a predecessor's TIME_WAIT window
 
 
 def listen_address(extra: dict[str, Any]) -> tuple[str, int]:
@@ -5156,17 +5163,29 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             try:
                 # aiohttp registers a site with its runner before binding, so a failed start leaves the
                 # site registered: rebuild the runner per attempt rather than reach into its internals.
-                for attempt in range(_BIND_ATTEMPTS):
+                # Retry across a monotonic deadline spanning the predecessor's TIME_WAIT window (#10297)
+                # instead of a fixed attempt count — a single stale TIME_WAIT socket can hold the port for
+                # up to ~60s after a restart.
+                deadline = time.monotonic() + _BIND_DEADLINE_SECONDS
+                attempt = 0
+                while time.monotonic() < deadline:
+                    attempt += 1
                     try:
                         self._site = await start_tcp_site(self._runner, self._host, self._port, log_tag=self.name)
                         break
                     except OSError as exc:
-                        if exc.errno != errno.EADDRINUSE or attempt == _BIND_ATTEMPTS - 1:
+                        if exc.errno != errno.EADDRINUSE:
+                            # Any non-port-conflict bind error (EACCES, EADDRNOTAVAIL, EINVAL, ...) is a
+                            # permanent misconfiguration — raise immediately, never retry.
+                            raise
+                        # Port still in TIME_WAIT/in use: give the predecessor a moment to release it, then
+                        # rebuild the runner (aiohttp registered the failed site with this runner already).
+                        if time.monotonic() >= deadline:
                             raise
                         await self._runner.cleanup()
                         self._runner = web.AppRunner(self._app)
                         await self._runner.setup()
-                        await asyncio.sleep(0.2 * (attempt + 1))
+                        await asyncio.sleep(0.2 * attempt)
             except OSError as exc:
                 await self._runner.cleanup()
                 self._runner = None
