@@ -4196,37 +4196,53 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             except Exception:
                 logger.exception("[api_server] approval-notify bridge failed")
 
-        def _clarify_callback_sync(question, choices, multi_select: bool = False):
+        def _clarify_callback_sync(questions):
             """Bridge a clarify tool call from the agent thread onto this run's SSE and
             block for the user's answer (clarify_tool's synchronous contract - the agent
             runs on a worker thread, so blocking here never stalls the event loop).
 
-            Mirrors gateway/run_turn_runner._clarify_callback_sync but routes the prompt
-            onto the NATIVE session SSE as a clarify.request event (so the Mercury
-            ClarifyCard surfaces it), resolved via POST /api/sessions/{id}/clarify. Uses
-            the gateway's merged tools.clarify_gateway primitive so the tool needs no
+            Mirrors gateway/run_turn_runner._clarify_callback_sync (single `questions`
+            list arg, {answers, outcome} return) but routes each question onto the
+            NATIVE session SSE as a clarify.request event (so the Mercury ClarifyCard
+            surfaces it), resolved via POST /api/sessions/{id}/clarify. Uses the
+            gateway's merged tools.clarify_gateway primitive so the tool needs no
             per-surface logic. Fail-closed: wait_for_response returns None after the
             configured timeout if the client never resolves (agent falls back to its own
-            best judgement) and the entry is cleaned up on session teardown."""
+            best judgement) and entries are cleaned up on resolution/teardown."""
             from tools import clarify_gateway as clarify_mod
+            from tools.clarify_gateway import CANCELLED, SKIPPED
             import uuid
-            clarify_id = uuid.uuid4().hex[:10]
-            choices_l = list(choices) if choices else None
-            session_key = (gateway_session_key or "").strip() or session_id or ""
-            clarify_mod.register(
-                clarify_id=clarify_id, session_key=session_key, question=str(question),
-                choices=choices_l, multi_select=bool(multi_select))
-            try:
-                events.enqueue("clarify.request", {
-                    "clarify_id": clarify_id, "question": str(question), "choices": choices_l,
-                    "multi_select": bool(multi_select), "run_id": run_id, "message_id": message_id})
-            except Exception:
-                logger.exception("[api_server] clarify.request emit failed")
-            try:
-                timeout = clarify_mod.get_clarify_timeout()
-            except Exception:
-                timeout = 3600
-            return clarify_mod.wait_for_response(clarify_id, timeout=timeout)
+            answers: dict = {}
+            reply: dict = {"answers": answers, "outcome": "submitted"}
+            for entry in questions:
+                clarify_id = uuid.uuid4().hex[:10]
+                question = str(entry["question"])
+                choices_l = [str(c) for c in entry["choices"]] if entry.get("choices") else None
+                multi = bool(entry.get("multi_select"))
+                session_key = (gateway_session_key or "").strip() or session_id or ""
+                clarify_mod.register(
+                    clarify_id=clarify_id, session_key=session_key, question=question,
+                    choices=choices_l, multi_select=multi)
+                try:
+                    events.enqueue("clarify.request", {
+                        "clarify_id": clarify_id, "question": question, "choices": choices_l,
+                        "multi_select": multi, "run_id": run_id, "message_id": message_id,
+                        "qid": entry.get("qid")})
+                except Exception:
+                    logger.exception("[api_server] clarify.request emit failed")
+                try:
+                    timeout = clarify_mod.get_clarify_timeout()
+                except Exception:
+                    timeout = 3600
+                raw = clarify_mod.wait_for_response(clarify_id, timeout=timeout)
+                if raw == CANCELLED:
+                    reply["outcome"] = "cancelled"
+                    break
+                if raw is None:
+                    reply.update(outcome="timed_out")
+                    break
+                answers[entry["qid"]] = None if raw == SKIPPED else raw
+            return reply
 
         async def _run_and_signal() -> None:
             # Interactive-approval opt-in (Mercury approval card): when the client
