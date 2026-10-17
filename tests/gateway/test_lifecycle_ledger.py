@@ -75,6 +75,15 @@ def test_sample_memory_has_expected_keys_on_linux() -> None:
     assert "mem_available_kib" in sample
 
 
+@pytest.mark.platforms("macos")  # psutil/resource-based; Darwin-only sampling
+def test_sample_memory_has_expected_keys_on_macos() -> None:
+    sample = sample_memory()
+    assert sample.get("rss_kib", 0) > 0
+    assert sample.get("mem_total_kib", 0) > 0
+    assert sample.get("mem_available_kib", 0) > 0
+    assert "swap_used_kib" in sample
+
+
 # ---------------------------------------------------------------------------
 # First boot / clean lifecycle
 # ---------------------------------------------------------------------------

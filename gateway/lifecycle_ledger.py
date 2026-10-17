@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import time
 from contextlib import closing
 from datetime import datetime, timezone, UTC
@@ -63,7 +64,11 @@ def _proc_fields(path: str, wanted: dict[str, str]) -> dict[str, int]:
 
 def sample_memory() -> dict[str, Any]:
     """Cheap /proc snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used.  Linux-only
-    (``{}`` elsewhere), never raises; the 30s heartbeat embeds it so OOM cycles are classifiable."""
+    (``{}`` elsewhere except macOS, which now samples too), never raises; the 30s heartbeat
+    embeds it so OOM cycles are classifiable."""
+    if sys.platform == "darwin":
+        return _sample_memory_darwin()
+
     sample = _proc_fields("/proc/self/status", {"VmRSS": "rss_kib"})
     mem = _proc_fields("/proc/meminfo", {"MemTotal": "mem_total_kib", "MemAvailable": "mem_available_kib",
                                          "SwapTotal": "SwapTotal", "SwapFree": "SwapFree"})
@@ -72,6 +77,28 @@ def sample_memory() -> dict[str, Any]:
     if swap_total is not None and swap_free is not None:
         sample["swap_used_kib"] = swap_total - swap_free
     return sample
+
+
+def _sample_memory_darwin() -> dict[str, Any]:
+    """macOS sample with the SAME KiB keys as the Linux path (rss/mem_total/mem_available/
+    swap_used) so the OOM heuristics in ``detect_unclean_exit``/``_suspected_oom`` and
+    ``memory_status`` apply unchanged.  Best-effort; never raises; ``{}`` on any failure.
+    Note ``ru_maxrss`` is BYTES and a high-water mark on Darwin, so ``rss_kib`` here is a
+    ceiling, not a live-equivalent RSS."""
+    try:
+        import resource
+        import psutil  # type: ignore
+        vm = psutil.virtual_memory()
+        sw = psutil.swap_memory()
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # bytes on Darwin
+        return {
+            "rss_kib": rss // 1024,
+            "mem_total_kib": vm.total // 1024,
+            "mem_available_kib": vm.available // 1024,
+            "swap_used_kib": sw.used // 1024,
+        }
+    except Exception:
+        return {}
 
 
 def _read_json(path: Path) -> Optional[dict[str, Any]]:

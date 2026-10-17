@@ -392,6 +392,12 @@ _GATEWAY_AUTH_ERROR_RE = re.compile(
 _GATEWAY_RATE_LIMIT_RE = re.compile(
     r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)", re.IGNORECASE)
 
+_GATEWAY_BILLING_ERROR_RE = re.compile(
+    r"(\b402\b|payment\s+required|insufficient[_\s]*(?:funds|credits|balance|quota)"
+    r"|out\s+of\s+(?:credits|quota)|credits?\s+(?:exhausted|depleted|used\s+up)"
+    r"|balance\s+(?:exhausted|insufficient|too\s+low))",
+    re.IGNORECASE)
+
 # Connection-failure markers: the first 8 also anchor the provider-failure envelope shape below.
 _CONNECTION_ERROR_MARKERS = (
     r"(?:\w+\.)?(?:api\s*)?connection\s*(?:error|timeout)", r"(?:\w+\.)?connect\s*(?:error|timeout)",
@@ -612,7 +618,10 @@ def _format_exec_approval_fallback(
         + t("gateway.exec_approval.text_choice_last", choice=choices[-1])
         + format_approval_deadline_line(approval_timeout_seconds()))
 
-# Ordered: rate-limit beats auth beats policy beats connection; first match wins. Rate-limit goes
+# Ordered: billing beats rate-limit beats auth beats policy beats connection; first match wins.
+# Billing goes ahead of rate-limit because _GATEWAY_RATE_LIMIT_RE matches the bare word "quota",
+# so an "insufficient_quota" (credits/billing exhausted) envelope would otherwise be answered as
+# a rate-limit, sending the user to /retry for a problem /retry cannot fix. Rate-limit then goes
 # first because a quota/429 envelope often also carries an auth-shaped preamble ("Provider
 # authentication failed: ... quota exhausted (429) ... Credentials are still valid") and re-auth can
 # never fix a quota, so text with both signals must fail safe toward the quota reply (#89401). Copy
@@ -626,6 +635,7 @@ def _format_exec_approval_fallback(
 # ``(pattern, catalog key)`` — the reply text is resolved with ``t()`` at reply time so the active
 # ``display.language`` applies; ``gateway.errors.*`` in ``locales/en.yaml`` holds the wording.
 _PROVIDER_ERROR_REPLIES = (
+    (_GATEWAY_BILLING_ERROR_RE, "gateway.errors.hint_quota"),
     (_GATEWAY_RATE_LIMIT_RE, "gateway.errors.rate_limited"),
     (_GATEWAY_AUTH_ERROR_RE, "gateway.errors.auth_failed"),
     (_GATEWAY_PROVIDER_POLICY_RE, "gateway.errors.bad_request"),

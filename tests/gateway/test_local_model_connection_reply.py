@@ -217,3 +217,15 @@ class TestQuotaExhaustedIsNotAnAuthFailure:
         result = TurnRunner(runner, ctx).run_sync()
         reply = result["final_response"]
         assert "/login" not in reply and "resets in ~33h" in reply and result["api_calls"] == 0
+
+    def test_billing_exhausted_is_not_rate_limited(self):
+        """A credits/billing-exhausted envelope maps to the provider-agnostic quota hint (/model),
+        never to the rate-limit reply (/retry) and never to the auth reply (/login)."""
+        billing = "API call failed after 3 retries: Error code: 402 - {'error': {'type': 'insufficient_quota'}}"
+        reply = _gateway_provider_error_reply(billing)
+        assert "/model" in reply
+        assert "rate-limiting" not in reply.lower()
+        assert "/retry" not in reply
+        assert "/login" not in reply
+        # a real transient rate-limit is still answered as a rate-limit (no regression)
+        assert "rate-limiting" in _gateway_provider_error_reply("rate limited after 3 retries").lower()
