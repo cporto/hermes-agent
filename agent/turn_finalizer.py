@@ -743,8 +743,10 @@ def finalize_turn(
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
     # A /steer landing after the final assistant turn has no tool batch to drain into;
-    # hand it back so it becomes the next user turn instead of being lost.
-    _leftover_steer, _leftover_uid = agent._drain_pending_steer()
+    # hand it back so it becomes the next user turn instead of being lost. A gateway transfer
+    # (ticketed) stays buffered: the claim's settlement returns it to its own queue place.
+    _leftover_uid = getattr(agent, "_pending_steer_uid", None)
+    _leftover_steer = (getattr(agent, "_drain_leftover_steer", None) or agent._drain_pending_steer)()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
         # Durable persistence: write the steer as a display_kind=steer user row so it
