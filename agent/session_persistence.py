@@ -133,6 +133,33 @@ def _durable_content(content: Any) -> Any:
     return "\n".join(txt) if txt else None
 
 
+def _durable_attachments(content: Any) -> Optional[list[dict[str, Any]]]:
+    """Sibling extractor to :func:`_durable_content`: record image refs (data URLs) from the ORIGINAL
+    live content so they survive in history, while the text projection keeps ``[screenshot]``.
+
+    Returns a list of ``{url, mime?}`` for image content-parts, or ``None`` when the message carries
+    no images. ``mime`` is parsed from the ``data:`` scheme when present (image_url type only).
+    """
+    if not isinstance(content, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for p in content:
+        if not isinstance(p, dict) or p.get("type") not in _IMAGE_PART_TYPES:
+            continue
+        img = p.get("image_url")
+        url = (img or {}).get("url") if isinstance(img, dict) else None
+        if not isinstance(url, str) or not url:
+            continue
+        entry: dict[str, Any] = {"url": url}
+        if url.startswith("data:"):
+            header = url[5:].partition(",")[0]
+            mime = header.split(";")[0] if header else None
+            if mime:
+                entry["mime"] = mime
+        out.append(entry)
+    return out or None
+
+
 def _persist_lock(agent):
     """Close and turn-start persistence can run on separate CLI threads: one critical section.
 
@@ -232,6 +259,7 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
         "timestamp": timestamp, "api_content": api_content,
         "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
+        "attachments": _durable_attachments(content),
         # Load-bearing for restart drain-window recovery dedup.
         "platform_message_id": msg.get("platform_message_id") or msg.get("message_id"),
         "observed": bool(msg.get("observed")),

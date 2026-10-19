@@ -472,6 +472,7 @@ CREATE TABLE IF NOT EXISTS messages (
     display_kind TEXT,
     display_metadata TEXT,
     display_identity BLOB,
+    attachments TEXT,
     display_order INTEGER,
     message_uid TEXT,
     absorbed_message_uids TEXT,

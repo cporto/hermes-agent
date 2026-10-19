@@ -33,8 +33,8 @@ _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_c
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind,
                    display_metadata, display_identity, message_uid, absorbed_message_uids, tool_call_uids,
-                   tool_call_uid)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                   tool_call_uid, attachments)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 # Every column this module knows how to read: the ones it writes plus the three SQLite/compaction
 # owns. `_row_to_message_dict` drops raw bytes ONLY outside this set — a schema column keeps its
 # key (and its typed decoder) even when a row holds a BLOB, so no reader ever loses msg["content"].
@@ -42,6 +42,9 @@ _MESSAGE_WRITE_COLUMNS = tuple(
     re.findall(r"\w+", _INSERT_MESSAGE_SQL.split("(", 1)[1].split(")", 1)[0])
 )
 _MESSAGE_SCHEMA_KEYS = frozenset(_MESSAGE_WRITE_COLUMNS) | {"id", "compacted", "display_order"}
+_INSERT_PARAM_COUNT = _INSERT_MESSAGE_SQL.split("VALUES (", 1)[1].split(")", 1)[0].count("?")
+assert len(_MESSAGE_WRITE_COLUMNS) == _INSERT_PARAM_COUNT, (
+    f"messages INSERT arity mismatch: {len(_MESSAGE_WRITE_COLUMNS)} cols vs {_INSERT_PARAM_COUNT} placeholders")
 _BUMP_GENERATION_SQL = """
             INSERT INTO conversation_generations (source, session_key, generation)
             VALUES (?, ?, 1)
@@ -201,6 +204,70 @@ class SessionMessagesMixin:
         return meta
 
     @staticmethod
+    def _encode_attachments(attachments: Any) -> Optional[str]:
+        """Serialize ``attachments`` (list of image refs) for its TEXT column. An already-serialized
+        JSON string (a ``dict(row)`` source re-serialized through ``_message_row_params``) is passed
+        through, not double-encoded — same defense as ``_encode_display_metadata``."""
+        if attachments is None or attachments == "":
+            return None
+        if isinstance(attachments, str):
+            return attachments
+        try:
+            return json.dumps(attachments)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _decode_attachments(attachments: Any) -> list[dict[str, Any]]:
+        """Parse the ``attachments`` TEXT column back into a list of image refs. Returns ``[]`` for
+        absent/malformed rows so callers never re-embed the raw JSON string. --- HISTORICAL
+        (now-reverted) fix for api-server stream re-encoding is irrelevant here; keep minimal."""
+        if not attachments:
+            return []
+        if not isinstance(attachments, str):
+            return [a for a in attachments if isinstance(a, dict)]
+        try:
+            value = json.loads(attachments)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return [a for a in value if isinstance(a, dict)] if isinstance(value, list) else []
+
+    @staticmethod
+    def _attachments_from_message(msg: dict[str, Any]) -> Any:
+        """Image refs to persist for ``msg``: the caller-set ``attachments`` if present, otherwise
+        extracted from a multimodal ``content`` list of image parts. Every writer routes through
+        ``_message_row_params`` (the arity hub), so append/batch/flush/import all persist uniformly.
+        ``mime`` is parsed from the ``data:`` scheme when present (image_url type only)."""
+        existing = msg.get("attachments")
+        if existing not in (None, ""):
+            return existing
+        content = msg.get("content")
+        if not isinstance(content, list) or not content:
+            return None
+        image_types = {"image_url"}
+        try:
+            from agent.session_persistence import _IMAGE_PART_TYPES
+            image_types = set(_IMAGE_PART_TYPES)
+        except Exception:
+            pass
+        out: list[dict[str, Any]] = []
+        for p in content:
+            if not isinstance(p, dict) or p.get("type") not in image_types:
+                continue
+            img = p.get("image_url")
+            url = (img or {}).get("url") if isinstance(img, dict) else None
+            if not isinstance(url, str) or not url:
+                continue
+            entry: dict[str, Any] = {"url": url}
+            if url.startswith("data:"):
+                header = url[5:].partition(",")[0]
+                mime = header.split(";")[0] if header else None
+                if mime:
+                    entry["mime"] = mime
+            out.append(entry)
+        return out or None
+
+    @staticmethod
     def _reasoning_json_text(value: Any) -> Optional[str]:
         """Serialize a structured reasoning field for its TEXT column. Strings are stored as-is: round-trips
         (get_messages -> replace_messages) hand back raw TEXT; re-dumping would double-encode it and
@@ -292,7 +359,8 @@ class SessionMessagesMixin:
             _str_or_none(msg.get("api_content")), _str_or_none(msg.get("display_kind")),
             display_metadata, self._display_identity(self._display_dedupe_key(identity_row)),
             message_uid_or_none(msg), _absorbed_uids_json(msg),
-            _tool_call_uids_json(msg), _tool_call_uid_or_none(msg))
+            _tool_call_uids_json(msg), _tool_call_uid_or_none(msg),
+            self._encode_attachments(self._attachments_from_message(msg)))
 
     @staticmethod
     def _stamp_tool_call_uids(msg: dict[str, Any], tool_calls: Any, batch_index: dict[str, str]) -> None:
@@ -362,6 +430,10 @@ class SessionMessagesMixin:
             metadata = self._decode_display_metadata(row["display_metadata"])
             if metadata is not None:
                 msg["display_metadata"] = metadata
+        if row["attachments"] is not None:
+            attachments = self._decode_attachments(row["attachments"])
+            if attachments:
+                msg["attachments"] = attachments
         if row["role"] == "assistant":
             for column in ("reasoning", "reasoning_content"):
                 if row[column] is not None:
@@ -1372,6 +1444,8 @@ class SessionMessagesMixin:
                 msg["tool_calls"], [], f"Failed to deserialize tool_calls in {warn_context}, falling back to []")
         if msg.get("display_metadata") is not None:
             msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+        if msg.get("attachments") is not None:
+            msg["attachments"] = self._decode_attachments(msg["attachments"])
         # A `SELECT *` picks up every column, including any BLOB added to the schema later; the
         # JSON encoder that serves these dicts over HTTP fails outright on raw bytes. Drop them
         # here, once, rather than needing a new named pop for each future binary column. Known
@@ -1642,6 +1716,8 @@ class SessionMessagesMixin:
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
                 msg["display_metadata"] = decoded
+            if row["attachments"] and (decoded := self._decode_attachments(row["attachments"])):
+                msg["attachments"] = decoded
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             msg.update(
