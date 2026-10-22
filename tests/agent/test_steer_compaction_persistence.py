@@ -36,7 +36,7 @@ def test_flushed_steer_keeps_one_display_identity_across_compactions(tmp_path):
         db.archive_and_compact(session_id, [dict(steer)])
 
     physical = db.get_messages(session_id, include_inactive=True)
-    assert len([row for row in physical if row["display_kind"] == "steer"]) == 3
+    assert len([row for row in physical if row["display_kind"] == "steer"]) == 1
     visible = db.get_messages(session_id, include_compacted=True)
     assert [(row["display_kind"], row["content"]) for row in visible] == [
         ("steer", steer["content"]),

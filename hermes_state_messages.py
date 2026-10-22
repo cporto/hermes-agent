@@ -1120,6 +1120,16 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
         # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
         self._carry_parent_timestamps(conn, session_id, compacted_messages)
+        # R2 (watermark/fallback parity): a carried steer is a verbatim-carry HUMAN turn that must NOT
+        # be re-inserted as a second active row. The original steer row (restored active above) is its
+        # only durable copy; the carry exists only to keep it in model context, not to add a row. Drop
+        # steer dicts from the insert set, mirroring _archive_named_rows so this path cannot hit the
+        # UNIQUE(session_id, message_uid) constraint on the restored original.
+        if compacted_messages:
+            compacted_messages = [
+                m for m in compacted_messages
+                if not (isinstance(m, dict) and m.get("display_kind") == "steer")
+            ]
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
         if tail_ids:
             self._clone_message_rows(conn, tail_ids)
