@@ -1941,6 +1941,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ('POST', '/api/sessions/{session_id}/rewind', self._handle_rewind_session),
             ('POST', '/api/sessions/{session_id}/approval', self._handle_session_approval),
             ('POST', '/api/sessions/{session_id}/clarify', self._handle_session_clarify),
+            ('GET', '/api/sessions/{session_id}/pending-controls', self._handle_session_pending_controls),
             ('POST', '/api/sessions/{session_id}/chat', self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
@@ -4470,6 +4471,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             or str(request.headers.get("X-Hermes-Interactive-Approval", "")).strip().lower() in ("1", "true", "yes"))
         # Interactive-clarify opt-in (Mercury ClarifyCard): when the client declares it
         # wants clarify questions surfaced on this stream (interactive_clarify: true or
+        # the X-Hermes-Interactive-Clarify header), bridge each gateway clarify.request
+        # onto this run's SSE so Mercury renders a ClarifyCard and the user can answer it
+        # via POST /api/sessions/{id}/clarify. Default OFF: an opted-out client keeps the
+        # current silent behaviour (the question waits out clarify_timeout).
+        _interactive_clarify = bool(
+            _req_body.get("interactive_clarify") is True
+            or str(request.headers.get("X-Hermes-Interactive-Clarify", "")).strip().lower() in ("1", "true", "yes"))
+        _clarify_notify = self._register_session_stream_clarify(
+            run_id, events, message_id) if _interactive_clarify else None
+
         def _approval_notify(approval_data: dict) -> None:
             """Bridge a gateway approval.request from the agent executor thread onto
             this run's SSE, mirroring api_server_runs._make_approval_notify: redact the
@@ -4525,7 +4536,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     conversation_history=history, stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
                     active_run_id=run_id, approval_notify_callback=approval_notify,
-                    approval_session_key=run_id, **ctx["run_kwargs"])
+                    approval_session_key=run_id, clarify_notify_callback=_clarify_notify,
+                    **ctx["run_kwargs"])
                 await events.flush()
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
@@ -4634,6 +4646,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             events.enqueue("approval.request", event)  # executor thread -> loop hop inside
         return _approval_notify
 
+    def _register_session_stream_clarify(self, run_id: str, events: _SessionEventQueue, message_id: str):
+        """Route a session-stream turn's interactive clarify questions onto its SSE queue
+        (Mercury ClarifyCard). Mirrors _register_session_stream_approval; the enqueued
+        payload MUST carry the pending control's id as ``clarify_id`` — the wire key the
+        client POSTs back to resolve it via POST /api/sessions/{id}/clarify."""
+        def _clarify_notify(clarify_data: dict[str, Any]) -> None:
+            event = dict(clarify_data or {})
+            event["run_id"] = run_id
+            event["message_id"] = message_id
+            event["clarify_id"] = event.get("clarify_id") or event.get("prompt_id") or ""
+            events.enqueue("clarify.request", event)  # executor thread -> loop hop inside
+        return _clarify_notify
+
     async def _drain_session_stream_task_on_disconnect(
         self, run_id: str, task: asyncio.Task, *, interrupt_message: str, shield_wait: bool
     ) -> None:
@@ -4648,13 +4673,54 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Mirror the inbound-path guard (run_busy.py): don't interrupt a turn that is still
         # driving active subagents just because the client's SSE stream dropped. The run is
         # tracked in _active_run_agents and keeps running in the background, so it does not
-        # need a live client to listen. A genuine stop on a subagent-less turn still aborts.
-        if not _agent_has_active_subagents(agent):
+        # need a live client to listen. Also don't interrupt while the session has a pending
+        # clarify: a refresh/re-open would otherwise cancel the live question within ~1s, so
+        # the reconnect path (Mercury pending-controls poll) has nothing left to re-show.
+        pending_control = False
+        sess_id = (self._run_statuses.get(run_id) or {}).get("session_id")
+        if sess_id:
+            try:
+                from tools import clarify_gateway as _cmod
+                pending_control = _cmod.has_pending(sess_id)
+            except Exception:
+                pending_control = False
+        if not _agent_has_active_subagents(agent) and not pending_control:
             with suppress(Exception):
                 agent.interrupt(interrupt_message)
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
+
+    @_require_auth
+    async def _handle_session_pending_controls(self, request: web.Request) -> web.Response:
+        """GET /api/sessions/{session_id}/pending-controls — read the pending interactive
+        controls (clarify) for a session, so a re-opened/refreshed client can re-render a
+        ClarifyCard whose live SSE event it missed. Read-only projection from
+        tools.clarify_gateway; the returned ``clarify_id`` is the key the client POSTs to
+        /api/sessions/{id}/clarify to answer it (fail-closed 409 on a stale/answered id)."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        from tools import clarify_gateway as _cmod
+        gateway_key, _ = self._parse_session_key_header(request)
+        entry = None
+        for key in (gateway_key, session_id):
+            if not key:
+                continue
+            entry = _cmod.get_pending_for_session(key, include_choice_prompts=True)
+            if entry is not None:
+                break
+        controls = []
+        if entry is not None:
+            controls.append({
+                "kind": "clarify",
+                "clarify_id": entry.clarify_id,
+                "question": entry.question,
+                "choices": entry.choices,
+                "multi_select": entry.multi_select,
+            })
+        return web.json_response({"session_id": session_id, "pending_controls": controls})
 
     @_require_auth
     async def _handle_session_model_lock(self, request: web.Request) -> web.Response:
@@ -5094,7 +5160,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_history_delivery: str = "", turn_author: Optional[dict[str, Any]] = None,
         relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
-        approval_session_key: Optional[str] = None, walked_from: Optional[str] = None) -> tuple:
+        approval_session_key: Optional[str] = None, clarify_notify_callback=None,
+        walked_from: Optional[str] = None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``approval_notify_callback`` (with ``approval_session_key``) routes dangerous-command
         approval requests to the caller's stream, keyed like ``/v1/runs`` approvals (#51871).
@@ -5124,7 +5191,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 bind_declared_conversation=bind_declared_conversation, request_id=request_id, run_owner_scope=run_owner_scope,
                 history_from_session=history_from_session, session_history_delivery=session_history_delivery,
                 turn_author=turn_author, resume_unanswered_turn=resume_unanswered_turn, relay_metadata=relay_metadata,
-                approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key)
+                approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key,
+                clarify_notify_callback=clarify_notify_callback)
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()

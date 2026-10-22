@@ -349,15 +349,20 @@ def recover_authority_api_turns(adapter, authority):
             logging.getLogger(__name__).warning('API session %s paused: %s', sid, exc.reason)
 
 
-async def run_api_turn(adapter, *, approval_notify_callback=None, approval_session_key=None, **kwargs):
+async def run_api_turn(adapter, *, approval_notify_callback=None, approval_session_key=None,
+                       clarify_notify_callback=None, **kwargs):
     admitted = await admit_api_turn_async(adapter, **kwargs)
-    if approval_notify_callback is None or not approval_session_key:
+    has_approval = approval_notify_callback is not None and approval_session_key
+    if not has_approval and clarify_notify_callback is None:
         return await observe_api_turn(admitted, **kwargs)
     # A streaming surface advertises its own run id (``chatcmpl-*`` / ``run_*``): bind it to this
     # exact admission so ``/v1/runs/{id}/approval`` answers the shared, generation-fenced prompt,
     # and hand that prompt to the stream's notifier in the event shape it already emits.
     aliases = adapter._run_admission_aliases
-    aliases[approval_session_key] = admitted[2]['admission_id']
+    bound = False
+    if has_approval:
+        aliases[approval_session_key] = admitted[2]['admission_id']
+        bound = True
 
     def sink(event_type, prompt):
         if event_type == 'approval.request':
@@ -366,11 +371,19 @@ async def run_api_turn(adapter, *, approval_notify_callback=None, approval_sessi
                 **{k: v for k, v in prompt.items() if k not in ('kind', 'prompt_id', 'choices')},
                 'request_id': prompt['prompt_id'], 'allow_session': 'session' in choices,
                 'allow_permanent': 'always' in choices})
+        elif event_type == 'clarify.request' and clarify_notify_callback is not None:
+            # Forward the shared (session_authority) clarify.request onto the run's own
+            # stream notifier; expose the pending control's id as ``clarify_id``, the wire
+            # key the api_server client POSTs back to resolve it. Keep question/choices/
+            # multi_select so the ClarifyCard renders.
+            clarify_notify_callback({
+                **{k: v for k, v in prompt.items() if k not in ('kind', 'prompt_id')},
+                'clarify_id': prompt['prompt_id']})
     try:
         with observe_api_controls(admitted, sink):
             return await observe_api_turn(admitted, **kwargs)
     finally:
-        if aliases.get(approval_session_key) == admitted[2]['admission_id']:
+        if bound and aliases.get(approval_session_key) == admitted[2]['admission_id']:
             aliases.pop(approval_session_key)
 
 

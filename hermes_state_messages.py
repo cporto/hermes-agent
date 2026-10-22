@@ -1079,10 +1079,14 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         steer_ids = {int(r["id"]) for r in conn.execute(
             "SELECT id FROM messages WHERE session_id = ? AND display_kind = 'steer' AND active = 1",
             (session_id,))}
-        tail_ids = [t for t in tail_ids if t not in steer_ids]
         tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
             conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
             (session_id, int(watermark)))
+        # A2: steers are ONE logical row per (session_id, message_uid); exclude steer rows from the
+        # tail clone set so a concurrent steer is not duplicated or rewound. (Must run AFTER the
+        # tail_ids assignment above — it previously ran before it and raised UnboundLocalError,
+        # aborting every in-place compaction commit via the watermark/fallback path, #21301.)
+        tail_ids = [t for t in tail_ids if t not in steer_ids]
         # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
         # concurrent append would steal a LIMIT slot.
         rewind_ids: list[int] = self._resolve_carried_row_ids(
