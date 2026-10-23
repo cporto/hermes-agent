@@ -4233,8 +4233,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     _win = 0
                 if _win > 0:
                     runtime["context_window"] = _win
-                    if not runtime.get("compressor_threshold_tokens"):
-                        runtime["compressor_threshold_tokens"] = _win
         return self._sanitize_runtime_metadata(
             # Same shared ladder /api/status uses. Before this was unified, the two endpoints disagreed on
             # the same page load — the sidebar strip read "running" (it probed GATEWAY_HEALTH_URL and scoped
