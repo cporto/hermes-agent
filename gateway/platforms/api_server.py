@@ -3608,6 +3608,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             isinstance(model_config, dict)
             and model_config.get("_delegate_from") is not None
         )
+        # Resolve the model from the session, else the model-config browser lock,
+        # else the gateway default. When known, expose the model context window so
+        # clients can render "used / total" without fetching runtime metadata.
+        _model = session.get("model")
+        if not _model:
+            try:
+                _model = (
+                    model_config.get("browser_model_lock", {}).get("model")
+                    if isinstance(model_config, dict)
+                    else None
+                )
+            except Exception:
+                _model = None
+        if not _model:
+            try:
+                from gateway.run import _resolve_gateway_model
+                _model = _resolve_gateway_model() or ""
+            except Exception:
+                _model = ""
+        if _model:
+            try:
+                from agent.model_metadata import get_model_context_length
+                _win = int(get_model_context_length(_model) or 0)
+            except Exception:
+                _win = 0
+            if _win > 0:
+                payload["context_window"] = _win
         return payload
 
     @staticmethod
