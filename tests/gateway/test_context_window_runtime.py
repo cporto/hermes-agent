@@ -9,6 +9,9 @@ Mercury reads ``usage.runtime ?? event.runtime`` (App.tsx) and takes
   * model-locked/route ("gated") sessions attach usage.runtime, but its window came from
     the agent's compressor which is 0 when the agent ran without a resolved model, so
     _turn_runtime_metadata must fall back to the metadata ladder too.
+The Desktop / TUI / CLI context meters read ``session.usage`` (next to ``session.stats``),
+whose window comes from the agent's ``context_compressor.context_length`` -- same 0-when-
+unresolved gap -- so gateway/session_usage._context falls back to metadata as well.
 """
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
@@ -72,3 +75,45 @@ def test_turn_runtime_metadata_surfaces_window_without_compressor():
         route={"provider": "deepinfra", "model": "deepseek-ai/DeepSeek-V4-Flash-0731"},
         requested_runtime=None, route_source="session", confirmed_runtime_lock=False)
     assert rt.get("context_window", 0) > 0
+
+
+# --- session.usage path (Desktop / TUI / CLI context meters) ---------------------------
+
+class _StubCompressor:
+    context_length = 0
+    last_prompt_tokens = 1000
+    _config_context_length = None
+    compression_count = 0
+
+
+def test_session_usage_context_falls_back_to_metadata(monkeypatch):
+    from gateway import session_usage
+    import gateway.run as run
+    monkeypatch.setattr(run, "_resolve_gateway_model",
+                        lambda *a, **k: "deepseek-ai/DeepSeek-V4-Flash-0731")
+
+    class A:
+        model = ""
+        _session_messages = None
+        _turn_base_usage_anchor = None
+
+    r = session_usage._context(A(), _StubCompressor())
+    assert (r.get("context_length") or 0) > 0
+
+
+def test_session_usage_keeps_compressor_window_when_present():
+    from gateway import session_usage
+
+    class A:
+        model = ""
+        _session_messages = None
+        _turn_base_usage_anchor = None
+
+    class C:
+        context_length = 4096
+        last_prompt_tokens = 1000
+        _config_context_length = None
+        compression_count = 0
+
+    r = session_usage._context(A(), C())
+    assert r.get("context_length") == 4096

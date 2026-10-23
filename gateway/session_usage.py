@@ -25,7 +25,31 @@ def _finite(value):
     return round(float(value), 2) if value is not None and value == value and 0 < value < 1e6 else None
 
 
+def _context_length_metadata(agent) -> int:
+    """Resolve a context window from model metadata when the agent ran without a
+    resolved model (compressor window is 0). Mirrors the api_server SSE fix; this
+    feed (``session.usage`` / ``session.stats``) serves the Desktop / TUI / CLI
+    context meters, which render their empty placeholder until a window is known.
+    Returns 0 when the model cannot be resolved, so an unknown window stays hidden.
+    """
+    try:
+        from agent.model_metadata import get_model_context_length
+        model = getattr(agent, "model", "") or ""
+        if not model:
+            try:
+                from gateway.run import _resolve_gateway_model
+                model = _resolve_gateway_model() or ""
+            except Exception:
+                model = ""
+        if not model:
+            return 0
+        return max(0, int(get_model_context_length(model) or 0))
+    except Exception:
+        return 0
+
+
 def _context(agent, compressor) -> dict:
+
     """Main's status-bar context figures (``_get_status_bar_snapshot``), clamped the same way."""
     if compressor is None:
         return {"last_prompt_tokens": 0, "context_tokens": 0, "context_length": None,
@@ -42,6 +66,8 @@ def _context(agent, compressor) -> dict:
         if anchored is not None and anchored > 0:
             tokens = anchored
     length = max(0, getattr(compressor, "context_length", 0) or 0)
+    if not length:  # agent without a resolved model -> compressor window 0; use metadata
+        length = _context_length_metadata(agent)
     return {"last_prompt_tokens": last, "context_tokens": min(tokens, length) if length else tokens,
             "context_length": length or None,
             "config_context_length": getattr(compressor, "_config_context_length", None),
