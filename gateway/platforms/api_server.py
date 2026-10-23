@@ -4208,9 +4208,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             headers["X-Hermes-Session-Key"] = gateway_session_key
         return headers
 
-    def _effective_turn_runtime(self, runtime_request: dict[str, Any], result: Any, usage: Any) -> dict[str, Any]:
+    def _effective_turn_runtime(self, runtime_request: dict[str, Any], result: Any, usage: Any, run_id: Optional[str] = None) -> dict[str, Any]:
         """Sanitized runtime metadata for a finished session-chat turn."""
         runtime = self._result_runtime(result, usage)
+        # Mercury header ring: surface the actual model's context window (and the
+        # compressor threshold) on the SSE runtime even when the turn had no explicit
+        # request/route/model-lock (default/global sessions), where _finish_turn_result
+        # intentionally attaches no runtime dict. The agent is registered per run in
+        # _active_run_agents; the sanitizer below preserves these fields only when >0.
+        if run_id and (not runtime.get("context_window") or runtime.get("context_window") <= 0):
+            _agent = getattr(self, "_active_run_agents", {}).get(run_id)
+            _cc = getattr(_agent, "context_compressor", None) if _agent else None
+            if _cc is not None:
+                _cc_len = getattr(_cc, "context_length", 0) or 0
+                if isinstance(_cc_len, (int, float)) and _cc_len > 0:
+                    runtime["context_window"] = _cc_len
+                    _thr = getattr(_cc, "threshold_tokens", 0) or 0
+                    if isinstance(_thr, (int, float)) and _thr > 0:
+                        runtime["compressor_threshold_tokens"] = _thr
         return self._sanitize_runtime_metadata(
             # Same shared ladder /api/status uses. Before this was unified, the two endpoints disagreed on
             # the same page load — the sidebar strip read "running" (it probed GATEWAY_HEALTH_URL and scoped
@@ -4543,7 +4558,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if is_dict else []
-                effective_runtime = self._effective_turn_runtime(runtime_request, result, usage)
+                effective_runtime = self._effective_turn_runtime(runtime_request, result, usage, run_id=run_id)
                 # Terminal status and flags come from the result (interrupted -> cancelled,
                 # unfinished -> failed); a late steer rides along as ``pending_steer`` for replay.
                 status, fields = _api_runs.terminal_run_status(result if is_dict else {})
