@@ -5134,7 +5134,27 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # window, threshold_tokens is where the agent compresses). Input/used is
         # already carried via usage.input_tokens (session_prompt_tokens).
         _cc = getattr(agent, "context_compressor", None) or None
-        runtime["context_window"] = getattr(_cc, "context_length", 0) or 0
+        _ctx_len = getattr(_cc, "context_length", 0) or 0
+        if not isinstance(_ctx_len, (int, float)) or _ctx_len <= 0:
+            # The compressor length is 0 when the agent ran without a resolved model
+            # (agent.model empty). Fall back to the model-metadata ladder so a gated
+            # session still surfaces a window on usage.runtime -- Mercury prefers that
+            # dict (u.runtime ?? ev.runtime) and reads context_window from it.
+            _m = ((requested_runtime or {}).get("model") or (route or {}).get("model")
+                  or runtime.get("model") or getattr(agent, "model", "") or "")
+            if not _m:
+                try:
+                    from gateway.run import _resolve_gateway_model
+                    _m = _resolve_gateway_model() or ""
+                except Exception:
+                    _m = ""
+            if _m:
+                try:
+                    from agent.model_metadata import get_model_context_length
+                    _ctx_len = int(get_model_context_length(_m) or 0)
+                except Exception:
+                    _ctx_len = 0
+        runtime["context_window"] = _ctx_len if isinstance(_ctx_len, (int, float)) and _ctx_len > 0 else 0
         runtime["compressor_threshold_tokens"] = getattr(_cc, "threshold_tokens", 0) or 0
         runtime["route_source"] = route_source or runtime.get("route_source") or "global"
         return self._sanitize_runtime_metadata(
