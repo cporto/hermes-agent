@@ -4211,21 +4211,30 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _effective_turn_runtime(self, runtime_request: dict[str, Any], result: Any, usage: Any, run_id: Optional[str] = None) -> dict[str, Any]:
         """Sanitized runtime metadata for a finished session-chat turn."""
         runtime = self._result_runtime(result, usage)
-        # Mercury header ring: surface the actual model's context window (and the
-        # compressor threshold) on the SSE runtime even when the turn had no explicit
-        # request/route/model-lock (default/global sessions), where _finish_turn_result
-        # intentionally attaches no runtime dict. The agent is registered per run in
-        # _active_run_agents; the sanitizer below preserves these fields only when >0.
-        if run_id and (not runtime.get("context_window") or runtime.get("context_window") <= 0):
-            _agent = getattr(self, "_active_run_agents", {}).get(run_id)
-            _cc = getattr(_agent, "context_compressor", None) if _agent else None
-            if _cc is not None:
-                _cc_len = getattr(_cc, "context_length", 0) or 0
-                if isinstance(_cc_len, (int, float)) and _cc_len > 0:
-                    runtime["context_window"] = _cc_len
-                    _thr = getattr(_cc, "threshold_tokens", 0) or 0
-                    if isinstance(_thr, (int, float)) and _thr > 0:
-                        runtime["compressor_threshold_tokens"] = _thr
+        # Mercury header ring: ensure the runtime carries the model's context window
+        # so the UI can render "used / total". _run_agent's finally pops the run agent
+        # before this runs, so resolve the window from the model-metadata ladder using
+        # the requested model (the client sends it), else the gateway default model.
+        # The sanitizer below preserves these fields only when >0.
+        if not runtime.get("context_window") or runtime.get("context_window") <= 0:
+            _req = runtime_request.get("requested") or {}
+            _model = _req.get("model") or runtime.get("model")
+            if not _model:
+                try:
+                    from gateway.run import _resolve_gateway_model
+                    _model = _resolve_gateway_model() or ""
+                except Exception:
+                    _model = ""
+            if _model:
+                try:
+                    from agent.model_metadata import get_model_context_length
+                    _win = int(get_model_context_length(_model) or 0)
+                except Exception:
+                    _win = 0
+                if _win > 0:
+                    runtime["context_window"] = _win
+                    if not runtime.get("compressor_threshold_tokens"):
+                        runtime["compressor_threshold_tokens"] = _win
         return self._sanitize_runtime_metadata(
             # Same shared ladder /api/status uses. Before this was unified, the two endpoints disagreed on
             # the same page load — the sidebar strip read "running" (it probed GATEWAY_HEALTH_URL and scoped
