@@ -4725,9 +4725,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                                         "timestamp": time.time(), **payload})
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            # Slice 3: a CLEAN client disconnect no longer interrupts the run. The
+            # turn keeps running in the background (like the subagent/clarify case)
+            # so a second device can attach and catch up (P3 mid-run mirror), and a
+            # transient network blip no longer aborts a good turn. Explicit abort is
+            # POST /v1/runs/{id}/stop (Mercury's Stop calls it).
             await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE client disconnected", shield_wait=False)
-            logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
+                run_id, task, interrupt_message="SSE client disconnected",
+                shield_wait=False, keep_running=True)
+            logger.info("Session SSE client disconnected; run %s continues in background", run_id)
         except asyncio.CancelledError:
             await self._drain_session_stream_task_on_disconnect(
                 run_id, task, interrupt_message="SSE task cancelled", shield_wait=True)
@@ -4763,9 +4769,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return _clarify_notify
 
     async def _drain_session_stream_task_on_disconnect(
-        self, run_id: str, task: asyncio.Task, *, interrupt_message: str, shield_wait: bool
+        self, run_id: str, task: asyncio.Task, *, interrupt_message: str, shield_wait: bool,
+        keep_running: bool = False,
     ) -> None:
-        """Preserve live run control refs until the executor-backed turn actually exits."""
+        """Preserve live run control refs until the executor-backed turn actually exits.
+
+        ``keep_running=True`` (clean client disconnect): do NOT interrupt the run and do
+        NOT wait on it here — it finishes in the background (already tracked for the
+        shutdown drain) so a reconnecting device can catch up via /v1/runs/{id}/events.
+        Explicit abort is POST /v1/runs/{id}/stop. ``keep_running=False`` keeps the
+        original behavior (interrupt unless subagents/clarify are active, then drain)."""
         agent = self._active_run_agents.get(run_id)
         if agent is None:
             if not task.done():
@@ -4773,6 +4786,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 with suppress(Exception):
                     await task
             return
+        if keep_running:
+            return  # leave the run to finish in the background
         # Mirror the inbound-path guard (run_busy.py): don't interrupt a turn that is still
         # driving active subagents just because the client's SSE stream dropped. The run is
         # tracked in _active_run_agents and keeps running in the background, so it does not
