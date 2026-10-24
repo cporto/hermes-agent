@@ -349,12 +349,46 @@ def recover_authority_api_turns(adapter, authority):
             logging.getLogger(__name__).warning('API session %s paused: %s', sid, exc.reason)
 
 
+def _persist_context_usage(adapter, admitted, usage):
+    """Persist this session's last-known CURRENT context snapshot (used = the settled turn's
+    session_prompt_tokens, window = the model's context length) so a client can render a
+    used/window gauge on session load without a live turn. Best-effort: a metadata write must
+    never break a turn, so every failure is swallowed."""
+    import logging
+    import time
+    try:
+        _authority, ref, _row = admitted
+        session_id = getattr(ref, 'session_id', None)
+        if not session_id or not isinstance(usage, dict):
+            return
+        used = int(usage.get('input_tokens') or 0)
+        window = int(usage.get('context_window') or 0)
+        model = usage.get('model') or ''
+        db = adapter._ensure_session_db()
+        if db is None:
+            return
+        if not model:
+            model = (db.get_session(session_id) or {}).get('model') or ''
+        if window <= 0 and model:
+            from agent.model_metadata import get_model_context_length
+            window = int(get_model_context_length(model) or 0)
+        if window <= 0:
+            return
+        db.update_session_context_usage(
+            session_id,
+            {'used': used, 'window': window, 'model': model, 'updated_at': time.time()})
+    except Exception:
+        logging.getLogger(__name__).debug('context_usage persist skipped', exc_info=True)
+
+
 async def run_api_turn(adapter, *, approval_notify_callback=None, approval_session_key=None,
                        clarify_notify_callback=None, **kwargs):
     admitted = await admit_api_turn_async(adapter, **kwargs)
     has_approval = approval_notify_callback is not None and approval_session_key
     if not has_approval and clarify_notify_callback is None:
-        return await observe_api_turn(admitted, **kwargs)
+        result, usage = await observe_api_turn(admitted, **kwargs)
+        _persist_context_usage(adapter, admitted, usage)
+        return result, usage
     # A streaming surface advertises its own run id (``chatcmpl-*`` / ``run_*``): bind it to this
     # exact admission so ``/v1/runs/{id}/approval`` answers the shared, generation-fenced prompt,
     # and hand that prompt to the stream's notifier in the event shape it already emits.
@@ -381,10 +415,12 @@ async def run_api_turn(adapter, *, approval_notify_callback=None, approval_sessi
                 'clarify_id': prompt['prompt_id']})
     try:
         with observe_api_controls(admitted, sink):
-            return await observe_api_turn(admitted, **kwargs)
+            result, usage = await observe_api_turn(admitted, **kwargs)
     finally:
         if bound and aliases.get(approval_session_key) == admitted[2]['admission_id']:
             aliases.pop(approval_session_key)
+    _persist_context_usage(adapter, admitted, usage)
+    return result, usage
 
 
 async def observe_api_turn(admitted, **kwargs):
