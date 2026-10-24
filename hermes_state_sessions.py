@@ -707,6 +707,20 @@ class SessionSessionsMixin:
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
+    def update_session_context_usage(self, session_id: str, payload: dict[str, Any]) -> None:
+        """Persist the session's last-known current-context snapshot (JSON) so a client can
+        render a used/window gauge on session load without waiting for a live turn. Additive:
+        the caller guards against errors so a metadata write never breaks a turn."""
+        if not session_id:
+            return
+        try:
+            blob = json.dumps(payload, separators=(",", ":"))
+        except Exception:
+            return
+        def _do(conn):
+            conn.execute("UPDATE sessions SET context_usage = ? WHERE id = ?", (blob, session_id))
+        self._execute_write(_do)
+
     def update_session_model(
         self, session_id: str, model: str, provider: Optional[str] = None, *,
         base_url: Optional[str] = None, api_mode: Optional[str] = None,

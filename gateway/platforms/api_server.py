@@ -145,6 +145,7 @@ from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms.api_server_runs import _RunStream
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.api_server_bot_chat import reset_local_title_owner
@@ -1944,6 +1945,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ('GET', '/api/sessions/{session_id}/pending-controls', self._handle_session_pending_controls),
             ('POST', '/api/sessions/{session_id}/chat', self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+            ("GET", "/api/sessions/{session_id}/active-run", self._handle_session_active_run),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
@@ -3635,6 +3637,31 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 _win = 0
             if _win > 0:
                 payload["context_window"] = _win
+        # Server-side hydration: expose the last-known CURRENT context snapshot (persisted at
+        # turn completion) so a client renders "used / window" on session load instead of the
+        # cumulative input_tokens billing total (which can exceed the window on long sessions).
+        _cu_raw = session.get("context_usage")
+        if isinstance(_cu_raw, str) and _cu_raw:
+            try:
+                _cu = json.loads(_cu_raw)
+            except Exception:
+                _cu = None
+            if isinstance(_cu, dict):
+                try:
+                    _cu_win = int(_cu.get("window") or 0)
+                except Exception:
+                    _cu_win = 0
+                if _cu_win > 0:
+                    try:
+                        _cu_used = int(_cu.get("used") or 0)
+                    except Exception:
+                        _cu_used = 0
+                    payload["context_usage"] = {
+                        "used": _cu_used,
+                        "window": _cu_win,
+                        "model": _cu.get("model") or "",
+                        "updated_at": _cu.get("updated_at"),
+                    }
         return payload
 
     @staticmethod
@@ -4478,6 +4505,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         events = _SessionEventQueue(session_id, run_id)
         queue, _event_payload = events.queue, events.payload
+        # Mercury P3 Slice 2 — bridge this session-chat run into the shared run event
+        # channel so GET /v1/runs/{id}/events can replay + follow it. _SessionEventQueue
+        # stays the single thread-safe writer; the consuming loop below fans each frame
+        # into _RunStream (which assigns its own seq for Last-Event-ID) and mirrors the
+        # terminal sentinel, so active-run discovery sees this run as long as it lives.
+        self._run_streams[run_id] = _RunStream()
+        self._run_streams_created[run_id] = time.time()
         # Claim ownership inside the request's profile scope before any run-keyed state
         # exists, so /v1/runs/{id}* control is confined to the starting profile.
         # See #93689.
@@ -4667,8 +4701,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     await response.write(b": keepalive\n\n")
                     continue
                 if item is None:
+                    # Terminal sentinel: mirror it into the run stream so replay + follow
+                    # (GET /v1/runs/{id}/events) sees a clean stream close, then stop.
+                    _mirror = self._run_streams.get(run_id)
+                    if _mirror is not None:
+                        _mirror.put_nowait(None)
                     break
                 name, payload = item
+                # Mirror this frame into the run stream unchanged in name/shape (its own
+                # seq is assigned by _RunStream, so Last-Event-ID replay lines up); the
+                # POST /chat/stream response below is untouched.
+                _mirror = self._run_streams.get(run_id)
+                if _mirror is not None:
+                    _mirror.put_nowait({"event": name, "run_id": run_id,
+                                        "timestamp": time.time(), **payload})
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             await self._drain_session_stream_task_on_disconnect(
@@ -4770,6 +4816,40 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "multi_select": entry.multi_select,
             })
         return web.json_response({"session_id": session_id, "pending_controls": controls})
+
+    @_require_auth
+    async def _handle_session_active_run(self, request: web.Request) -> web.Response:
+        """GET /api/sessions/{session_id}/active-run — discover the newest non-terminal run
+        bridged from a session chat stream into the shared run channel (Mercury P3 Slice 2).
+        Returns ``{'active': true, 'run_id', 'status', 'last_seq'}`` so a re-opened client can
+        subscribe to GET /v1/runs/{id}/events from ``last_seq``; ``{'active': false}`` when no
+        live run matches the session."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
+        best = None  # (created_at, status, run_id)
+        for run_id, status in self._run_statuses.items():
+            if status.get("session_id") != session_id:
+                continue
+            if status.get("status") in TERMINAL_STATUSES:
+                continue
+            created = status.get("created_at") or 0.0
+            if best is None or created > best[0]:
+                best = (created, status.get("status") or "queued", run_id)
+        if best is None:
+            return web.json_response({"active": False, "session_id": session_id})
+        _, run_status, run_id = best
+        stream = self._run_streams.get(run_id)
+        last_seq = (stream.next_seq - 1) if stream is not None else 0
+        return web.json_response({
+            "active": True,
+            "session_id": session_id,
+            "run_id": run_id,
+            "status": run_status,
+            "last_seq": max(0, last_seq),
+        })
 
     @_require_auth
     async def _handle_session_model_lock(self, request: web.Request) -> web.Response:
@@ -5347,6 +5427,28 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     result, usage = self._finish_turn_result(
                         agent, result, session_id, route=route, requested_runtime=requested_runtime,
                         route_source=route_source, confirmed_runtime_lock=confirmed_runtime_lock)
+                    # Persist the last-known CURRENT context snapshot (used = this turn's
+                    # session_prompt_tokens, window = model context length) so clients can hydrate
+                    # a used/window gauge on session load without a live turn. Best-effort: a
+                    # metadata write must never break the turn.
+                    try:
+                        _ctx_used = int((usage or {}).get("input_tokens") or 0)
+                        _ctx_model = getattr(agent, "model", None) or session_model or ""
+                        _ctx_win = 0
+                        if _ctx_model:
+                            from agent.model_metadata import get_model_context_length
+                            _ctx_win = int(get_model_context_length(_ctx_model) or 0)
+                        _ctx_sid = getattr(agent, "session_id", None) or session_id
+                        if _ctx_sid and _ctx_win > 0:
+                            _ctx_db = self._ensure_session_db()
+                            if _ctx_db is not None:
+                                _ctx_db.update_session_context_usage(
+                                    _ctx_sid,
+                                    {"used": _ctx_used, "window": _ctx_win,
+                                     "model": _ctx_model, "updated_at": time.time()},
+                                )
+                    except Exception:
+                        logger.debug("context_usage persist skipped", exc_info=True)
                     if muted and isinstance(result, dict):
                         # Project presentation only after finishing the source outcome. Keep
                         # the agent's result, transcript, failure flags and usage intact.
