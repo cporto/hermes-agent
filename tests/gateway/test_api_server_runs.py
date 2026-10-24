@@ -1976,6 +1976,85 @@ class TestRunIdempotency:
         assert "run_old" not in adapter._run_owners
 
 
+class TestOrphanReaper:
+    """Status-anchored orphan reaper (cporto/mercury#1): a non-terminal run with no
+    live owner/watcher and no recent progress is marked 'failed' so active-run stops
+    reporting a dead run and the terminal-status TTL collects it. All tests are
+    deterministic (explicit ``now``, no sleeps). The progress heartbeat, not
+    agent-presence, is the liveness discriminator; a hung executor keeps its stale
+    ``_active_run_agents`` entry (its finally never runs), so presence cannot prove
+    life."""
+
+    @staticmethod
+    def _stall(adapter) -> float:
+        return float(adapter._RUN_ORPHAN_STALL_TTL)
+
+    def test_reaps_orphaned_stuck_running(self, adapter):
+        adapter._run_statuses["orphan"] = {
+            "status": "running", "created_at": 1.0, "updated_at": 1.0,
+            "session_id": "s1",
+        }
+        now = self._stall(adapter) + 10
+        adapter._sweep_orphaned_runs_once(now)
+        status = adapter._run_statuses["orphan"]
+        assert status["status"] == "failed"
+        assert status["last_event"] == "run.orphaned"
+        # _set_run_status stamps updated_at with real time.time(); age it deterministically
+        # to prove the existing terminal-status TTL then collects the record.
+        adapter._run_statuses["orphan"]["updated_at"] = 0
+        adapter._sweep_orphaned_runs_once(float(adapter._RUN_STATUS_TTL) + 10)
+        assert "orphan" not in adapter._run_statuses
+
+    def test_preserves_run_with_live_task(self, adapter):
+        task = MagicMock()
+        task.done.return_value = False
+        adapter._active_run_tasks["live_task"] = task
+        adapter._run_statuses["live_task"] = {
+            "status": "running", "created_at": 1.0, "updated_at": 1.0,
+        }
+        adapter._sweep_orphaned_runs_once(self._stall(adapter) + 10)
+        assert adapter._run_statuses["live_task"]["status"] == "running"
+
+    def test_preserves_run_with_recent_progress(self, adapter):
+        # healthy background session-chat turn: no asyncio task, agent present, fresh
+        # progress heartbeat (the Slice-3 case that must never be reaped)
+        adapter._active_run_agents["live_progress"] = object()
+        adapter._run_statuses["live_progress"] = {
+            "status": "running", "created_at": 1.0, "updated_at": 1.0,
+        }
+        adapter._run_last_progress_at["live_progress"] = self._stall(adapter) + 100
+        adapter._sweep_orphaned_runs_once(self._stall(adapter) + 500)
+        assert adapter._run_statuses["live_progress"]["status"] == "running"
+
+    def test_reaps_run_that_went_silent_even_with_stale_agent(self, adapter):
+        # the hang case: agent entry persists (executor finally never ran), but the
+        # run has made no progress -> reaped anyway. agent-presence alone would miss it.
+        adapter._active_run_agents["hang"] = object()
+        adapter._run_statuses["hang"] = {
+            "status": "running", "created_at": 0.0, "updated_at": 0.0,
+        }
+        adapter._sweep_orphaned_runs_once(self._stall(adapter) + 10)
+        assert adapter._run_statuses["hang"]["status"] == "failed"
+
+    def test_preserves_run_with_live_subscriber(self, adapter):
+        class _Stream:
+            subscribers = {"client"}
+        adapter._run_streams["watched"] = _Stream()
+        adapter._run_statuses["watched"] = {
+            "status": "running", "created_at": 0.0, "updated_at": 0.0,
+        }
+        adapter._sweep_orphaned_runs_once(self._stall(adapter) + 10)
+        assert adapter._run_statuses["watched"]["status"] == "running"
+
+    def test_does_not_remark_completed_run(self, adapter):
+        now = self._stall(adapter) + 10
+        adapter._run_statuses["done_run"] = {
+            "status": "completed", "created_at": now, "updated_at": now,
+        }
+        adapter._sweep_orphaned_runs_once(now)
+        assert adapter._run_statuses["done_run"]["status"] == "completed"
+
+
 class TestRunEventsHeadFlush:
     """The SSE head must reach the client before the first event (#80757).
 

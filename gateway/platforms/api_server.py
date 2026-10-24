@@ -28,7 +28,7 @@ import time
 import uuid
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
@@ -1261,11 +1261,13 @@ class _SessionEventQueue:
     """Ordered SSE event queue for one /api/sessions/{id}/chat/stream run. ``payload`` stamps
     session_id/run_id/seq/ts; ``enqueue`` is executor-thread safe (hops onto the owning loop)."""
 
-    def __init__(self, session_id: str, run_id: str):
+    def __init__(self, session_id: str, run_id: str,
+                 progress_bump: Optional[Callable[[], None]] = None):
         self.loop = asyncio.get_running_loop()
         self.queue: asyncio.Queue[Optional[tuple[str, dict[str, Any]]]] = asyncio.Queue()
         self.session_id = session_id
         self.run_id = run_id
+        self._progress_bump = progress_bump
         self.seq = 0
         # Cross-thread puts handed to the loop and not yet applied. The loop does not order them
         # against the worker future's completion, so the turn's terminal frames wait on flush().
@@ -1282,6 +1284,12 @@ class _SessionEventQueue:
 
     def enqueue(self, name: str, payload: dict[str, Any]) -> None:
         event = self.payload(name, payload)
+        # Every streamed frame is proof the executor is alive and working: feed the
+        # orphan reaper's progress heartbeat so a run that is merely slow (not hung)
+        # is never reaped. Fires even after the client disconnects because the turn
+        # producer keeps enqueueing in the background (Slice 3).
+        if self._progress_bump is not None:
+            self._progress_bump()
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -4503,7 +4511,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             model_lock=("accepted" if ctx["lock_active"] else ""))
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
-        events = _SessionEventQueue(session_id, run_id)
+        events = _SessionEventQueue(session_id, run_id,
+                                    progress_bump=lambda: _api_runs._mark_run_progress(self, run_id))
         queue, _event_payload = events.queue, events.payload
         # Mercury P3 Slice 2 — bridge this session-chat run into the shared run event
         # channel so GET /v1/runs/{id}/events can replay + follow it. _SessionEventQueue
@@ -5533,6 +5542,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _WIDGET_LIVE_TTL = 120  # seconds of recency a run needs to keep a non-idle pill phase
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_ORPHAN_STALL_TTL = 3600  # seconds of no run progress before a non-terminal run is reaped as orphaned
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, Any]:
         return _api_runs._set_run_status(self, run_id, status, **fields)

@@ -235,7 +235,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
-    ) = ({} for _ in range(7))
+        self._run_last_progress_at,
+    ) = ({} for _ in range(8))
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -267,6 +268,9 @@ def _close_run_state(self) -> None:
 def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, Any]:
     """Update pollable run status without exposing private agent objects."""
     now = time.time()
+    # Any status write is run activity: keep the orphan reaper's progress heartbeat
+    # fresh so a run being transitioned is never mistaken for a stalled orphan.
+    self._run_last_progress_at[run_id] = now
     current = self._run_statuses.get(run_id, {})
     previous_status = str(current.get("status") or "")
     field_names = set(fields)
@@ -563,7 +567,18 @@ def _forget_run(self, run_id: str, *tables) -> None:
 def _retire_live_run(self, run_id: str) -> None:
     """Retire agent/task/approval control state once the executor-backed task is done."""
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
-                self._stopping_run_ids, self._shutdown_interrupted_run_ids)
+                self._stopping_run_ids, self._shutdown_interrupted_run_ids, self._run_last_progress_at)
+
+
+def _mark_run_progress(self, run_id: str) -> None:
+    """Record recent run activity so the orphan reaper treats the run as live.
+
+    Bumped by the session-chat stream event queue (every delta/tool/commentary
+    frame) and by _set_run_status. A HUNG executor goes silent here, while a
+    healthy-but-slow run keeps producing events — this progress heartbeat is the
+    only reliable way to tell the two apart once the run is no longer subscribed.
+    """
+    self._run_last_progress_at[run_id] = time.time()
 
 
 def _drop_run_transport(self, run_id: str) -> None:
@@ -1535,6 +1550,34 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
             _unregister_approval_notify(self._run_approval_sessions.get(run_id))
             _retire_live_run(self, run_id)
     for run_id, status in list(self._run_statuses.items()):
-        if (status.get("status") in {"completed", "failed", "cancelled"}
+        if (status.get("status") in TERMINAL_STATUSES
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
             _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
+    # Reap orphaned non-terminal runs. A run's executor can die or hang without ever
+    # reaching a terminal status (the session-chat turn is executor-thread-backed, so it
+    # never has an asyncio task; a hang keeps its stale _active_run_agents entry forever
+    # because its finally never runs). Such a run would otherwise report active:true for
+    # a DEAD run via GET /api/sessions/{id}/active-run, making Mercury attach to a run
+    # that never emits. Mark it "failed" (a terminal status) once it has made no progress
+    # for _RUN_ORPHAN_STALL_TTL and no live owner/watcher remains — the loop above and
+    # the following TTL then collect the record. The progress heartbeat (_mark_run_progress
+    # via _set_run_status + the session stream) is the discriminator, NOT agent-presence
+    # alone: a hung executor keeps its agent entry, so presence cannot prove liveness.
+    for run_id, status in list(self._run_statuses.items()):
+        if status.get("status") in TERMINAL_STATUSES:
+            continue
+        task = self._active_run_tasks.get(run_id)
+        if task is not None and not task.done():
+            continue  # a live task owns the run
+        stream = self._run_streams.get(run_id)
+        if stream is not None and stream.subscribers:
+            continue  # a client is attached; leave it alone
+        created = float(status.get("created_at", 0) or 0) or 0.0
+        last_progress = float(self._run_last_progress_at.get(run_id) or 0) or created
+        if now - last_progress <= self._RUN_ORPHAN_STALL_TTL:
+            continue  # recent activity -> genuinely working
+        logger.warning("[api_server] reaping orphaned non-terminal run %s (status=%s): no progress for %.0fs",
+                       run_id, status.get("status"), now - last_progress)
+        self._set_run_status(run_id, "failed",
+                             error="Run stopped making progress and no live agent owns it; reaped as orphaned.",
+                             last_event="run.orphaned", finished_at=now)
