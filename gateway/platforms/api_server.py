@@ -4684,6 +4684,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         pass
                 self._active_run_agents.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                # P3 Slice 2 bridge: the run's event channel lives only for the
+                # IN-PROGRESS window (a subscriber that joined mid-run already got
+                # its terminal sentinel). Drop the transport now so ownership
+                # releases at terminal like the pre-existing contract expects
+                # (completed-run catch-up is served by refreshLive()/transcript,
+                # not this stream — see gate review). Mirrors _drop_run_transport.
+                self._run_streams.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
                 self._release_run_owner_if_forgotten(run_id)
                 await events.flush()
                 await queue.put(_event_payload("done", {}))
