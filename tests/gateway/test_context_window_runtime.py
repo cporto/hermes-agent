@@ -16,6 +16,8 @@ unresolved gap -- so gateway/session_usage._context falls back to metadata as we
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 
+import pytest
+
 
 def _adapter():
     return APIServerAdapter(PlatformConfig(enabled=True))
@@ -33,34 +35,38 @@ class _StubAgent:
 
 # --- event-runtime path (default/global sessions) -------------------------------------
 
-def test_requested_model_surfaces_context_window():
+@pytest.mark.asyncio
+async def test_requested_model_surfaces_context_window():
     a = _adapter()
-    rt = a._effective_turn_runtime(
+    rt = await a._effective_turn_runtime(
         {"requested": {"provider": "deepinfra", "model": "deepseek-ai/DeepSeek-V4-Flash-0731"}},
         {}, {})
     assert rt.get("context_window", 0) > 0
 
 
-def test_default_session_falls_back_to_gateway_default_window(monkeypatch):
-    import gateway.run as run
+@pytest.mark.asyncio
+async def test_default_session_falls_back_to_gateway_default_window(monkeypatch):
+    from gateway import run
     monkeypatch.setattr(run, "_resolve_gateway_model",
                         lambda *a, **k: "deepseek-ai/DeepSeek-V4-Flash-0731")
     a = _adapter()
-    rt = a._effective_turn_runtime({"requested": {"provider": "", "model": ""}}, {}, {})
+    rt = await a._effective_turn_runtime({"requested": {"provider": "", "model": ""}}, {}, {})
     assert rt.get("context_window", 0) > 0
 
 
-def test_no_fabricated_compressor_threshold():
+@pytest.mark.asyncio
+async def test_no_fabricated_compressor_threshold():
     a = _adapter()
-    rt = a._effective_turn_runtime(
+    rt = await a._effective_turn_runtime(
         {"requested": {"provider": "deepinfra", "model": "deepseek-ai/DeepSeek-V4-Flash-0731"}},
         {}, {})
     assert "compressor_threshold_tokens" not in rt
 
 
-def test_existing_window_is_not_overridden():
+@pytest.mark.asyncio
+async def test_existing_window_is_not_overridden():
     a = _adapter()
-    rt = a._effective_turn_runtime(
+    rt = await a._effective_turn_runtime(
         {"requested": {"provider": "deepinfra", "model": "deepseek-ai/DeepSeek-V4-Flash-0731"}},
         {"runtime": {"context_window": 4096}}, {})
     assert rt.get("context_window") == 4096
@@ -88,7 +94,7 @@ class _StubCompressor:
 
 def test_session_usage_context_falls_back_to_metadata(monkeypatch):
     from gateway import session_usage
-    import gateway.run as run
+    from gateway import run
     monkeypatch.setattr(run, "_resolve_gateway_model",
                         lambda *a, **k: "deepseek-ai/DeepSeek-V4-Flash-0731")
 

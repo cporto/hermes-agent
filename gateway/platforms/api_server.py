@@ -3586,7 +3586,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return _error_response("Session database unavailable", 503, code="session_db_unavailable")
 
     @staticmethod
-    def _session_response(session: dict[str, Any]) -> dict[str, Any]:
+    async def _session_response(
+        session: dict[str, Any],
+    ) -> dict[str, Any]:
         """Return a stable, client-safe session representation."""
         safe_keys = (
             "id", "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason",
@@ -3639,8 +3641,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 _model = ""
         if _model:
             try:
-                from agent.model_metadata import get_model_context_length
-                _win = int(get_model_context_length(_model) or 0)
+                from agent.model_metadata import get_model_context_length_async
+                _win = int(await get_model_context_length_async(_model) or 0)
             except Exception:
                 _win = 0
             if _win > 0:
@@ -3789,7 +3791,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Back-filled pins arrive PAST the limit: counting them would report a page that doesn't exist.
         windowed = sum(1 for s in sessions if not s.get("pinned"))
         return web.json_response({
-            "object": "list", "data": [self._session_response(s) for s in sessions],
+            "object": "list",
+            "data": await asyncio.gather(*(self._session_response(s) for s in sessions)),
             "limit": limit, "offset": offset, "has_more": windowed >= limit})
 
     @_require_auth
@@ -3861,7 +3864,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response(f"{err[1]}: {session_id}", 409, code=err[0])
         if err and err.startswith("title:"):
             return _error_response(err[len("title:"):], 400, code="invalid_title")
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
+        return web.json_response({"object": "hermes.session", "session": await self._session_response(session)}, status=201)
 
     @_require_auth
     async def _handle_get_session(self, request: web.Request) -> web.Response:
@@ -3879,7 +3882,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if _t:
             session["title"] = _t
 
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        return web.json_response({"object": "hermes.session", "session": await self._session_response(session)})
 
     @_require_auth
     async def _handle_patch_session(self, request: web.Request) -> web.Response:
@@ -3919,7 +3922,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
         session = await asyncio.to_thread(db.get_session, session_id) or session
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        return web.json_response({"object": "hermes.session", "session": await self._session_response(session)})
 
     @_require_auth
     async def _handle_delete_session(self, request: web.Request) -> web.Response:
@@ -4044,7 +4047,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except ValueError as exc:
             return _error_response(str(exc), 400, code="invalid_title")
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
-        return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+        return web.json_response({"object": "hermes.session", "session": await self._session_response(fork)}, status=201)
 
     @_require_auth
     async def _handle_rewind_session(self, request: "web.Request") -> "web.Response":
@@ -4270,7 +4273,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             headers["X-Hermes-Session-Key"] = gateway_session_key
         return headers
 
-    def _effective_turn_runtime(self, runtime_request: dict[str, Any], result: Any, usage: Any, run_id: Optional[str] = None) -> dict[str, Any]:
+    async def _effective_turn_runtime(self, runtime_request: dict[str, Any], result: Any, usage: Any, run_id: Optional[str] = None) -> dict[str, Any]:
         """Sanitized runtime metadata for a finished session-chat turn."""
         runtime = self._result_runtime(result, usage)
         # Mercury header ring: ensure the runtime carries the model's context window
@@ -4289,8 +4292,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     _model = ""
             if _model:
                 try:
-                    from agent.model_metadata import get_model_context_length
-                    _win = int(get_model_context_length(_model) or 0)
+                    from agent.model_metadata import get_model_context_length_async
+                    _win = int(await get_model_context_length_async(_model) or 0)
                 except Exception:
                     _win = 0
                 if _win > 0:
@@ -4488,7 +4491,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             {"object": "hermes.session.chat.completion", "status": _response_status(result),
              "session_id": effective_session_id or session_id,
              "message": {"role": "assistant", "content": final_response}, "usage": usage,
-             "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)},
+             "runtime": await self._effective_turn_runtime(ctx["runtime_request"], result, usage)},
             headers=headers)
 
     @_admit_api_agent_request
@@ -4635,7 +4638,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if is_dict else []
-                effective_runtime = self._effective_turn_runtime(runtime_request, result, usage, run_id=run_id)
+                effective_runtime = await self._effective_turn_runtime(runtime_request, result, usage, run_id=run_id)
                 # Terminal status and flags come from the result (interrupted -> cancelled,
                 # unfinished -> failed); a late steer rides along as ``pending_steer`` for replay.
                 status, fields = _api_runs.terminal_run_status(result if is_dict else {})

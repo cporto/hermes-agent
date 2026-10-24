@@ -63,7 +63,7 @@ async def create_peer_bot_chat(adapter, body):
     if ref is None:
         return None
     row = await asyncio.to_thread(authority.db.get_session, ref.session_id)
-    return web.json_response({'object': 'hermes.session', 'session': adapter._session_response(row)}, status=201)
+    return web.json_response({'object': 'hermes.session', 'session': await adapter._session_response(row)}, status=201)
 
 
 def _refusal(authority, tip, exc):
