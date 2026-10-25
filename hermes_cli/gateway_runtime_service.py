@@ -203,7 +203,7 @@ def _launchd(home: Path, deadline: float) -> ExistingService | None:
                                          "state = running" in result.stdout))
             continue
         # launchctl's native absent-service code; other errors retain uncertainty.
-        if result.returncode != 113:
+        if result.returncode not in (113, 125):
             raise RuntimeStartError("service_manager_unavailable")
     if len(found) > 1:
         raise RuntimeStartError("service_scope_conflict", "conflict")
