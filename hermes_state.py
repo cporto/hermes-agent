@@ -470,10 +470,14 @@ class SessionDB(
 
     # Only these state-owned producers join automatic stale-open reconciliation; messaging/UI
     # sources have their own lifecycle owners; unknown sources fail closed.
-    # See #60609.  `recovered` = placeholders `hermes sessions recover` synthesizes for
-    # orphaned messages (no live owner, never stamped ended_at); without it they are immortal.
+    # See #60609.  Viewer/self-owned UI sources (`webui`) join the sweep like `api_server`,
+    # but messaging-gateway-owned sources (e.g. `telegram`) stay excluded: ending a still-routed
+    # telegram row arms the Groundhog Day routing loop (#60609). `recovered` = placeholders
+    # `hermes sessions recover` synthesizes for orphaned messages (no live owner, never stamped
+    # ended_at); without it they are immortal.
     _AUTO_PRUNE_STALE_OPEN_SOURCES: tuple[str, ...] = (
         "cli", "cron", "kanban", "acp", "api_server", "subagent", "tool", "recovered",
+        "webui",
     )
 
     # ── Write-contention tuning ──
