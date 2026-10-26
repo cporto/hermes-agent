@@ -11,7 +11,7 @@
     "tests-js"
   ],
   "scripts": {
-    "postinstall": "echo '✅ Node dependencies installed. Run: python run_agent.py --help'",
+    "postinstall": "echo '\u2705 Node dependencies installed. Run: python run_agent.py --help'",
     "install:root": "npm install --workspaces=false",
     "install:web": "npm install --workspace web",
     "install:tui": "npm install --workspace ui-tui",
@@ -60,14 +60,17 @@
     "nanoid@^3": "3.3.18",
     "nanoid@^6": "6.0.0",
     "js-yaml@^4": "4.3.2",
-    "undici@^6": "6.29.0",
-    "undici@^7": "7.30.0",
+    "undici@^6": "6.29.1",
+    "undici@^7": "7.30.1",
     "postcss": "8.5.23",
     "tar": "7.5.22",
     "source-map-js": "1.2.2",
     "yaml": "2.9.1",
-    "vitest": "4.1.11",
-    "@vitest/mocker": "4.1.11"
+    "vitest": "4.1.12",
+    "@vitest/mocker": "4.1.12",
+    "vite": "8.3.5",
+    "zod": "4.6.7",
+    "sanitize-html": "2.18.1"
   },
   "engines": {
     "node": "^22.22.0 || ^24.11.0 || >=26.0.0",
