@@ -30,6 +30,7 @@ import {
   type IpcMainInvokeEvent,
   Menu,
   type MenuItemConstructorOptions,
+  nativeImage,
   nativeTheme,
   powerMonitor,
   powerSaveBlocker,
@@ -16733,10 +16734,26 @@ ipcMain.handle('hermes:savePastedText', async (_event, payload) => {
 })
 
 ipcMain.handle('hermes:saveClipboardImage', async () => {
-  const image = clipboard.readImage()
+  // Electron 45 rewrote the clipboard to a promise-based API; the legacy
+  // readImage() was removed. Decode the first image MIME we get and normalize
+  // to PNG (mirrors the old readImage -> toPNG flow).
+  const items = await clipboard.read()
 
-  if (image && !image.isEmpty()) {
-    return writeComposerImage(image.toPNG(), '.png')
+  for (const item of items) {
+    const imageType = item.types.find((type) => type.startsWith('image/'))
+
+    if (imageType) {
+      try {
+        const blob = (await item.getType(imageType)) as Blob
+        const image = nativeImage.createFromBuffer(Buffer.from(await blob.arrayBuffer()))
+
+        if (image && !image.isEmpty()) {
+          return writeComposerImage(image.toPNG(), '.png')
+        }
+      } catch {
+        // Skip this clipboard item; try the next MIME / fall back below.
+      }
+    }
   }
 
   // WSL2/WSLg doesn't bridge clipboard *images* from the Windows host to the

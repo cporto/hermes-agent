@@ -9,7 +9,8 @@ import { rehashPayloadDigests } from './payload-digests.mjs'
 export function createMacSigner(policy) {
   return async (opts, packager) => {
     const target = opts.platform === 'mas' ? (opts.type === 'development' ? 'mas-dev' : 'mas') : 'mac'
-    const optionsForFile = await packager.helper.getOptionsForFile(opts.app, target, policy)
+    // electron-builder 27 added a 4th `identity` param (Nullish); we pass undefined to keep prior behavior.
+    const optionsForFile = await packager.helper.getOptionsForFile(opts.app, target, policy, undefined)
     const inheritedIgnore = opts.ignore
     const { sign } = await import('@electron/osx-sign')
     await sign({
