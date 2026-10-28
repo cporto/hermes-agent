@@ -474,7 +474,12 @@ class TestAgentExecution:
         # here doesn't set an explicit session_id string so the guard skips
         # the annotation — header will fall back to the provided session_id.
         assert result["final_response"] == "ok"
-        assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+        assert usage["input_tokens"] == 1
+        assert usage["output_tokens"] == 2
+        assert usage["total_tokens"] == 3
+        # Runtime metadata is now attached unconditionally (was gated to non-global
+        # routes). A default send carries a runtime block with route_source=global.
+        assert usage.get("runtime", {}).get("route_source") == "global"
         create_kwargs = mock_create_agent.call_args.kwargs
         assert create_kwargs["requested_model"] == "MiniMax-M3"
         assert create_kwargs["requested_provider"] == "minimax"
