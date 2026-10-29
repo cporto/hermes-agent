@@ -349,7 +349,7 @@ def recover_authority_api_turns(adapter, authority):
             logging.getLogger(__name__).warning('API session %s paused: %s', sid, exc.reason)
 
 
-def _persist_context_usage(adapter, admitted, usage):
+async def _persist_context_usage(adapter, admitted, usage):
     """Persist this session's last-known CURRENT context snapshot (used = the settled turn's
     session_prompt_tokens, window = the model's context length) so a client can render a
     used/window gauge on session load without a live turn. Best-effort: a metadata write must
@@ -370,8 +370,8 @@ def _persist_context_usage(adapter, admitted, usage):
         if not model:
             model = (db.get_session(session_id) or {}).get('model') or ''
         if window <= 0 and model:
-            from agent.model_metadata import get_model_context_length
-            window = int(get_model_context_length(model) or 0)
+            from agent.model_metadata import get_model_context_length_async
+            window = int(await get_model_context_length_async(model) or 0)
         if window <= 0:
             return
         db.update_session_context_usage(
@@ -387,7 +387,7 @@ async def run_api_turn(adapter, *, approval_notify_callback=None, approval_sessi
     has_approval = approval_notify_callback is not None and approval_session_key
     if not has_approval and clarify_notify_callback is None:
         result, usage = await observe_api_turn(admitted, **kwargs)
-        _persist_context_usage(adapter, admitted, usage)
+        await _persist_context_usage(adapter, admitted, usage)
         return result, usage
     # A streaming surface advertises its own run id (``chatcmpl-*`` / ``run_*``): bind it to this
     # exact admission so ``/v1/runs/{id}/approval`` answers the shared, generation-fenced prompt,
@@ -419,7 +419,7 @@ async def run_api_turn(adapter, *, approval_notify_callback=None, approval_sessi
     finally:
         if bound and aliases.get(approval_session_key) == admitted[2]['admission_id']:
             aliases.pop(approval_session_key)
-    _persist_context_usage(adapter, admitted, usage)
+    await _persist_context_usage(adapter, admitted, usage)
     return result, usage
 
 

@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 #: How long a caller waits for the owner's control socket after seeing its record (see module doc).
 ATTACH_CHANNEL_WAIT_S = 5.0
 _CHANNEL_POLL_S = 0.25
+#: How long a live-but-silent host holder may go without answering ``identify`` before a
+#: supervised unit takes the host over (reusing --replace) instead of retry-looping forever.
+#: Must exceed the 5s boot-race window and the watchdog's 3-missed-probe (~90s) fatal threshold.
+ATTACH_TAKEOVER_GRACE_S = 90.0
 
 START = "start"
 ATTACH = "attach"
@@ -86,6 +90,9 @@ class HostGateway:
     #: True once the owner has said ``multiplex: False``: a per-profile gateway that cannot be asked
     #: to serve anyone else — see ``START`` in the module doc.
     standalone: bool = False
+    #: Wall-clock epoch (record.create_time) the owner published; the silence anchor
+    #: ``decide`` uses to take over a live-but-unanswering owner (FIX-B).
+    created_at: float = 0.0
 
     def serves(self, profile: str) -> bool:
         if not self.served_known:
@@ -209,12 +216,14 @@ def _probe_host_gateway(wait_for_channel: float) -> Optional[HostGateway]:
     while True:
         identity = _identify(home)
         if _identity_matches(identity, record, home):
-            return HostGateway(record.pid, home, _served_from_identity(identity))
+            return HostGateway(record.pid, home, _served_from_identity(identity),
+                              created_at=record.create_time or 0.0)
         if time.monotonic() >= deadline:
             break
         time.sleep(_CHANNEL_POLL_S)
     # An owner exists and has not answered: the served set is UNKNOWN, never the record's word.
-    return HostGateway(record.pid, home, (), served_known=False)
+    return HostGateway(record.pid, home, (), served_known=False,
+                      created_at=record.create_time or 0.0)
 
 
 def host_gateway(*, wait_for_channel: float = 0.0) -> Optional[HostGateway]:
@@ -419,6 +428,17 @@ def decide(our_home: Path, *, replace: bool = False) -> HostAttachDecision:
     if not gateway.served_known:
         # The owner never answered, so we know only that it exists. ATTACH here (on the record's
         # word) parked a supervised unit against a served set nobody had committed to yet.
+        # A live-but-silent owner (incarnation proven, identify won't answer) past the takeover
+        # grace is a frozen loop, not a boot race: reuse --replace to take it over so a supervised
+        # launchd unit self-heals instead of retry-looping forever (FIX-B). decide() never raises:
+        # any gauge failure below degrades to the transient REFUSE.
+        silent_since = gateway.created_at or 0.0
+        if silent_since > 0 and (time.time() - silent_since) >= ATTACH_TAKEOVER_GRACE_S:
+            logger.warning(
+                "Host gateway %s has not answered identify for %.0fs (>= %ss); taking it over "
+                "as replacement instead of retry-looping",
+                gateway.describe(), time.time() - silent_since, ATTACH_TAKEOVER_GRACE_S)
+            return HostAttachDecision(REPLACE_HOST, "", gateway)
         return HostAttachDecision(
             REFUSE, _unknown_served_message(gateway, profile), gateway, transient=True)
     return HostAttachDecision(REFUSE, _refuse_message(gateway, profile), gateway)

@@ -4709,13 +4709,28 @@ def _replace_target_belongs_to_other_profile(existing_pid: int) -> bool:
         from gateway.host_attach import host_gateway, profile_name_for_home
 
         owner = host_gateway()
-        if owner is not None and owner.pid == existing_pid and owner.serves(
-                profile_name_for_home(get_hermes_home())):
-            logger.warning(
-                "--replace target PID %s is the host gateway serving %d profile(s) (%s); "
-                "replacing it restarts the host process for all of them.",
-                existing_pid, len(owner.profiles), ", ".join(owner.profiles) or "unknown")
-            return False
+        if owner is not None and owner.pid == existing_pid:
+            from gateway.status import _same_hermes_home
+            # Allow takeover when the host gateway is THIS home's owner. host_gateway() is
+            # non-None only when record_names_live_owner proved the owner's incarnation, so a
+            # liveness-proven incumbent is our host multiplexer even when its served set is
+            # UNKNOWN (served_known=False: identify never answered / a frozen loop). Falling to
+            # the pid-record proof for a silent owner was the dead-end that re-wedged the host.
+            same_home = owner.served_known and owner.serves(
+                profile_name_for_home(get_hermes_home()))
+            if not same_home:
+                try:
+                    same_home = bool(_same_hermes_home(owner.home, get_hermes_home()))
+                except Exception:
+                    same_home = profile_name_for_home(owner.home) == profile_name_for_home(
+                        get_hermes_home())
+            if same_home:
+                logger.warning(
+                    "--replace target PID %s is the host gateway (served_known=%s) serving "
+                    "%d profile(s) (%s); replacing it restarts the host process for all of them.",
+                    existing_pid, owner.served_known, len(owner.profiles),
+                    ", ".join(owner.profiles) or "unknown")
+                return False
     except Exception:
         logger.debug("host served-set ownership probe failed for PID %s", existing_pid, exc_info=True)
     # On Windows there is no systemd/launchd service query at all (_get_service_pids() returns an empty
