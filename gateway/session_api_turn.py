@@ -381,6 +381,32 @@ async def _persist_context_usage(adapter, admitted, usage):
         logging.getLogger(__name__).debug('context_usage persist skipped', exc_info=True)
 
 
+async def _persist_turn_usage(adapter, admitted, usage):
+    """Persist the settled assistant reply's token usage onto its message row so a client
+    can show a per-message token badge on history load (no live turn needed). Best-effort:
+    a metadata write must never break a turn, so every failure is swallowed."""
+    import logging
+    try:
+        _authority, ref, _row = admitted
+        session_id = getattr(ref, 'session_id', None)
+        if not session_id or not isinstance(usage, dict):
+            return
+        in_tok = usage.get('input_tokens')
+        out_tok = usage.get('output_tokens')
+        tot = usage.get('total_tokens')
+        if tot is None and (in_tok is not None or out_tok is not None):
+            tot = int(in_tok or 0) + int(out_tok or 0)
+        if tot is None:
+            return
+        db = adapter._ensure_session_db()
+        if db is None:
+            return
+        db.update_latest_assistant_usage(
+            session_id, int(in_tok or 0), int(out_tok or 0), int(tot))
+    except Exception:
+        logging.getLogger(__name__).debug('turn usage persist skipped', exc_info=True)
+
+
 async def run_api_turn(adapter, *, approval_notify_callback=None, approval_session_key=None,
                        clarify_notify_callback=None, **kwargs):
     admitted = await admit_api_turn_async(adapter, **kwargs)
@@ -388,6 +414,7 @@ async def run_api_turn(adapter, *, approval_notify_callback=None, approval_sessi
     if not has_approval and clarify_notify_callback is None:
         result, usage = await observe_api_turn(admitted, **kwargs)
         await _persist_context_usage(adapter, admitted, usage)
+        await _persist_turn_usage(adapter, admitted, usage)
         return result, usage
     # A streaming surface advertises its own run id (``chatcmpl-*`` / ``run_*``): bind it to this
     # exact admission so ``/v1/runs/{id}/approval`` answers the shared, generation-fenced prompt,
@@ -420,6 +447,7 @@ async def run_api_turn(adapter, *, approval_notify_callback=None, approval_sessi
         if bound and aliases.get(approval_session_key) == admitted[2]['admission_id']:
             aliases.pop(approval_session_key)
     await _persist_context_usage(adapter, admitted, usage)
+    await _persist_turn_usage(adapter, admitted, usage)
     return result, usage
 
 

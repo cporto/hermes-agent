@@ -721,6 +721,29 @@ class SessionSessionsMixin:
             conn.execute("UPDATE sessions SET context_usage = ? WHERE id = ?", (blob, session_id))
         self._execute_write(_do)
 
+    def update_latest_assistant_usage(
+        self, session_id: str, input_tokens: int, output_tokens: int, total_tokens: int
+    ) -> None:
+        """Persist token usage onto the session's newest message row, but ONLY when that
+        newest row is an assistant reply (i.e. this settled turn ended with an assistant
+        message). Guarding on role prevents a turn that ended with a pending-steer user row
+        from mis-tagging the PREVIOUS turn's assistant message with this turn's usage.
+        Best-effort callers swallow errors so a metadata write never breaks a turn."""
+        if not session_id:
+            return
+        def _do(conn):
+            top = conn.execute(
+                "SELECT id, role FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if not top or top["role"] != "assistant":
+                return
+            conn.execute(
+                "UPDATE messages SET token_count = ?, input_tokens = ?, output_tokens = ? WHERE id = ?",
+                (total_tokens, input_tokens, output_tokens, top["id"]),
+            )
+        self._execute_write(_do)
+
     def update_session_model(
         self, session_id: str, model: str, provider: Optional[str] = None, *,
         base_url: Optional[str] = None, api_mode: Optional[str] = None,

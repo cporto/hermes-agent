@@ -524,6 +524,8 @@ CREATE TABLE IF NOT EXISTS messages (
     effect_disposition TEXT,
     timestamp REAL NOT NULL,
     token_count INTEGER,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
     finish_reason TEXT,
     reasoning TEXT,
     reasoning_content TEXT,
