@@ -2112,3 +2112,110 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("user_consent") is False
         assert "timed out without user response" in result["message"]
         assert "Silence is not consent" in result["message"]
+
+
+class TestSmartSkipForOptedInInteractiveApi:
+    """The landed smart-skip (c2d4c868f4): an api_server session that OPTED INTO
+    interactive gateway-approval (Mercury's ApprovalCard) and has a registered
+    gateway notify callback must NOT let the smart guardian auto-approve a
+    dangerous command — it must fall through to the human card (gateway notify)
+    so the flagged command is surfaced for consent."""
+
+    SESSION_KEY = "test-smart-skip-optin-api"
+
+    def _cfg_smart(self, monkeypatch):
+        monkeypatch.setattr(
+            approval_context, "_get_approval_config",
+            lambda: {"mode": "smart"},
+        )
+
+    def _env(self):
+        import os as _os
+        saved = {k: _os.environ.get(k) for k in ("HERMES_SESSION_KEY", "HERMES_GATEWAY_SESSION", "HERMES_CRON_SESSION", "HERMES_YOLO_MODE")}
+        _os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
+        _os.environ.pop("HERMES_GATEWAY_SESSION", None)
+        _os.environ.pop("HERMES_CRON_SESSION", None)
+        _os.environ.pop("HERMES_YOLO_MODE", None)
+        return saved
+
+    def _restore_env(self, saved):
+        import os as _os
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+    def test_opted_in_interactive_skips_smart_gate_and_reaches_notify(self, monkeypatch):
+        from tools import approval as mod
+
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+
+        self._cfg_smart(monkeypatch)
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", False)
+        # The smart guardian must NOT be consulted: if it is, fail loudly.
+        def _boom(*a, **k):
+            raise AssertionError("_smart_gate should NOT run for an opted-in interactive api_server session")
+        monkeypatch.setattr(mod, "_smart_gate", _boom)
+
+        saved = self._env()
+        token = approval_context.set_api_interactive_approval(True)
+        try:
+            # A real human card surface: the gateway notify callback is registered
+            # under the same session key the gate will look up.
+            notified = []
+            mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
+            # Blocking wait would hang the test; give the gateway path a resolved
+            # approve so we can assert the human path RAN (and returned a verdict).
+            def _fake_await(session_key, notify_cb, data, surface):
+                if notify_cb is not None:
+                    notify_cb(data)  # as the real _await_gateway_decision does
+                return {"choice": "once", "resolved": True}
+            monkeypatch.setattr(mod, "_await_gateway_decision", _fake_await)
+
+            result = mod.check_all_command_guards("chmod 777 /tmp/hermes_smart_skip_probe.txt", "local")
+        finally:
+            approval_context.reset_api_interactive_approval(token)
+            self._restore_env(saved)
+            mod._gateway_notify_cbs.clear()
+            mod._gateway_queues.clear()
+
+        # Smart gate was skipped -> no smart_approved marker, and the human notify
+        # path ran (registered callback fired with the card data).
+        assert result.get("smart_approved") is not True
+        assert result["approved"] is True
+        assert notified, "gateway notify callback should have fired (human card surfaced)"
+        assert "chmod 777 /tmp/hermes_smart_skip_probe.txt" in (notified[0].get("command") or "")
+
+    def test_non_opted_in_still_runs_smart_gate(self, monkeypatch):
+        """Without the api-interactive opt-in, smart mode keeps the guardian gate
+        (the existing behavior) — the skip is ONLY for opted-in interactive cards."""
+        from tools import approval as mod
+
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+
+        self._cfg_smart(monkeypatch)
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", False)
+        called = []
+        monkeypatch.setattr(mod, "_smart_gate",
+                            lambda *a, **k: (called.append(True) or
+                                             ({"approved": True, "smart_approved": True, "message": None}, False)))
+
+        saved = self._env()
+        import os as _os
+        _os.environ["HERMES_GATEWAY_SESSION"] = "1"  # normal gateway session (no api opt-in)
+        try:
+            result = mod.check_all_command_guards("chmod 777 /tmp/hermes_smart_skip_probe.txt", "local")
+        finally:
+            self._restore_env(saved)
+            mod._gateway_notify_cbs.clear()
+            mod._gateway_queues.clear()
+
+        assert called, "smart gate should still run without the opt-in"
+        assert result.get("smart_approved") is True
