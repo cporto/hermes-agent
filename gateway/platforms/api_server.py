@@ -864,6 +864,9 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return text
 
 
+_PARTIAL_MEDIA_PREFIXES = ("MEDIA:", "MEDIA", "MEDI", "MED", "ME", "M")
+
+
 class _MediaStreamBuffer:
     """Reassemble a ``MEDIA:`` tag that arrives split across multiple streamed content
     deltas so it is resolved as one unit, mirroring the non-streaming inlining behavior.
@@ -876,29 +879,41 @@ class _MediaStreamBuffer:
         self._buf = ""
 
     def push(self, delta: str) -> str:
-        """Append one content delta; return the safe-to-emit prefix, resolved to data URLs.
-
-        A token begun after the last complete match may still be split mid-path, so it is
-        held in the buffer; once it is terminated (or the stream ends and flush() runs) it
-        is resolved exactly like the non-streaming path.
-        """
+        """Append one content delta; return the safe-to-emit prefix, resolved to data URLs."""
         if not delta:
             return ""
         self._buf += delta
-        last_media = self._buf.rfind("MEDIA:")
-        if last_media < 0:
-            out, self._buf = self._buf, ""
-            return _resolve_media_to_data_urls(out)
-        last_complete_end = 0
-        for m in MEDIA_TAG_CLEANUP_RE.finditer(self._buf):
-            last_complete_end = m.end()
-        if last_media >= last_complete_end:
-            out, self._buf = self._buf[:last_media], self._buf[last_media:]
-        else:
-            out, self._buf = self._buf, ""
+        emit_len = self._safe_emit_len()
+        if emit_len <= 0:
+            return ""
+        out, self._buf = self._buf[:emit_len], self._buf[emit_len:]
         if "MEDIA:" in out:
             return _resolve_media_to_data_urls(out)
         return out
+
+    def _safe_emit_len(self) -> int:
+        """Longest prefix of the buffer that is safe to emit: everything before a possibly
+        chunk-split ``MEDIA:`` tag (a trailing incomplete tag, or a trailing partial prefix of
+        ``MEDIA:`` such as ``MED`` awaiting ``IA:``)."""
+        buf = self._buf
+        n = len(buf)
+        last_complete_end = 0
+        for m in MEDIA_TAG_CLEANUP_RE.finditer(buf):
+            last_complete_end = m.end()
+        last_media = buf.rfind("MEDIA:")
+        open_start = n  # default: nothing is open -> emit all
+        if last_media >= 0 and last_media >= last_complete_end:
+            # A tag marker at/after the last complete match: it may still be mid-path.
+            open_start = min(open_start, last_media)
+        # A trailing partial prefix of "MEDIA:" (e.g. "MED") may be the start of a split tag.
+        for p in _PARTIAL_MEDIA_PREFIXES:
+            if buf.endswith(p):
+                cand = n - len(p)
+                # Only treat as a real fragment when it is at a word boundary (not mid-word).
+                if cand <= 0 or not buf[cand - 1].isalpha():
+                    open_start = min(open_start, cand)
+                break
+        return open_start
 
     def flush(self) -> str:
         """Emit whatever remains (call once when the stream ends)."""

@@ -94,6 +94,16 @@ class TestMediaStreamHoldback(unittest.TestCase):
         self.assertEqual(buf.push("just plain text"), "just plain text")
         self.assertEqual(buf.flush(), "")
 
+    def test_tag_prefix_split_inlined(self):
+        p = self._write_png()
+        buf = _MediaStreamBuffer()
+        first = buf.push("Here: MED")          # partial "MEDIA:" prefix is held
+        self.assertNotIn("MEDIA:", first)
+        second = buf.push(f"IA:{p} done")       # completes "MEDIA:" + path
+        self.assertIn("data:image/png;base64,", first + second)
+        self.assertNotIn("MEDIA:/", first + second)
+        self.assertEqual(buf.flush(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

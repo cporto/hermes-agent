@@ -1313,6 +1313,51 @@ class TestChatCompletionsEndpoint:
                 assert str(p) not in body
 
     @pytest.mark.asyncio
+    async def test_stream_media_tag_prefix_split_inlined(self, adapter):
+        """Even when the model splits the ``MEDIA:`` marker itself across deltas (e.g. 'MED'+'IA:'),
+        the stream is reassembled and inlined as a single data URL, not leaked raw (#136892)."""
+        import base64
+        import tempfile
+        from pathlib import Path
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
+            "h6FO1AAAAABJRU5ErkJggg=="
+        )
+        d = Path(tempfile.mkdtemp(prefix="hermes_api_stream_media_split"))
+        p = d / "shot.png"
+        p.write_bytes(png)
+
+        async def _mock_run_agent(**kwargs):
+            cb = kwargs.get("stream_delta_callback")
+            if cb:
+                cb("result: MED")   # partial "MEDIA:" prefix
+                cb(f"IA:{p}")        # completes "MEDIA:" + path
+                cb(" done")
+            return (
+                {"final_response": f"result: MEDIA:{p} done", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "show me"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "[DONE]" in body
+                assert "data:image/png;base64," in body
+                assert "MEDIA:/" not in body
+                assert str(p) not in body
+
+    @pytest.mark.asyncio
     async def test_stream_emits_tool_lifecycle_with_call_id(self, adapter):
         """Regression for #16588.
 
