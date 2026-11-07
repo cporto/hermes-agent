@@ -4148,13 +4148,44 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         choice = choice_map.get(choice, choice)
         request_id = body.get("request_id")
         reason = body.get("reason")
+        # The native session-stream approval gate parks its pending under the RUN id
+        # (the worker binds set_current_session_key(approval_session_key=run_id); see
+        # _run_and_signal -> _run_agent). Mercury resolves via this /api/sessions route
+        # and does NOT send X-Hermes-Session-Key, so session_key above is just session_id
+        # and would look in _gateway_queues[session_id], which is empty -> resolve 0 and
+        # the gate times out BLOCKED even though the card rendered. Resolve the session's
+        # active run (run_id) instead — it is the key the gate actually awaits on — while
+        # keeping the pending keyed by run_id (never the shared session key) so concurrent
+        # turns on one session cannot cross-resolve. Fall back to session_key for the
+        # gateway-session-key path (other clients that DO send the header).
+        from gateway.platforms.api_server_runs import TERMINAL_STATUSES
+        run_ids = []
+        for run_id, status in self._run_statuses.items():
+            if status.get("session_id") != session_id:
+                continue
+            if status.get("status") in TERMINAL_STATUSES:
+                continue
+            run_ids.append((status.get("created_at") or 0.0, run_id))
+        # Newest active run first.
+        run_ids.sort(reverse=True)
+        resolve_keys = [rid for _, rid in run_ids]
+        if session_key and session_key not in resolve_keys:
+            resolve_keys.append(session_key)
         try:
             from tools.approval import resolve_gateway_approval
-            resolved = await asyncio.to_thread(
-                resolve_gateway_approval, session_key, choice,
-                resolve_all=body.get("resolve_all") is True,
-                reason=(reason if isinstance(reason, str) and reason else None),
-                request_id=(request_id if isinstance(request_id, str) and request_id else None))
+            resolved = 0
+            for rkey in resolve_keys:
+                try:
+                    n = await asyncio.to_thread(
+                        resolve_gateway_approval, rkey, choice,
+                        resolve_all=body.get("resolve_all") is True,
+                        reason=(reason if isinstance(reason, str) and reason else None),
+                        request_id=(request_id if isinstance(request_id, str) and request_id else None))
+                except Exception:
+                    n = 0
+                resolved += n
+                if resolved > 0:
+                    break
         except Exception as exc:
             return _error_response(_redact_api_error_text(exc), 500, code="approval_resolve_failed")
         return web.json_response({"object": "approval", "session_id": session_id, "resolved": resolved})
