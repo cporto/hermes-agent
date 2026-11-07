@@ -4207,17 +4207,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         choice = choice_map.get(choice, choice)
         request_id = body.get("request_id")
         reason = body.get("reason")
-        # The native session-stream approval gate parks its pending under the RUN id
-        # (the worker binds set_current_session_key(approval_session_key=run_id); see
-        # _run_and_signal -> _run_agent). Mercury resolves via this /api/sessions route
-        # and does NOT send X-Hermes-Session-Key, so session_key above is just session_id
-        # and would look in _gateway_queues[session_id], which is empty -> resolve 0 and
-        # the gate times out BLOCKED even though the card rendered. Resolve the session's
-        # active run (run_id) instead — it is the key the gate actually awaits on — while
-        # keeping the pending keyed by run_id (never the shared session key) so concurrent
-        # turns on one session cannot cross-resolve. Fall back to session_key for the
-        # gateway-session-key path (other clients that DO send the header).
+        # The native session-stream approval gate parks its pending under the RUN id:
+        # _run_agent._run() re-enters set_current_session_key(approval_session_key=run_id)
+        # in the executor worker (the approval gate reads it there), and registers its notify
+        # under that key. Mercury resolves via this /api/sessions route and sends no
+        # X-Hermes-Session-Key, so a plain session_key would miss the run-scoped entry and
+        # resolve 0 even though the card rendered. The authoritative run -> park-key map is
+        # _run_approval_sessions (the same map the proven /v1/runs/{id}/approval path uses);
+        # derive each active run of this session's park key from it, never assume the park key
+        # equals run_id by guessing from a non-contract _run_statuses session_id stamp. Run
+        # keys are turn-unique, so resolve them FIFO WITHOUT request_id (a bad client-echoed
+        # request_id must not zero a correctly-keyed resolve). Keep request_id strict only for
+        # the shared gateway-session-key fallback, where concurrent turns can coexist and the
+        # id is the correct disambiguator.
         from gateway.platforms.api_server_runs import TERMINAL_STATUSES
+        from tools.approval import resolve_gateway_approval
         run_ids = []
         for run_id, status in self._run_statuses.items():
             if status.get("session_id") != session_id:
@@ -4227,24 +4231,36 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             run_ids.append((status.get("created_at") or 0.0, run_id))
         # Newest active run first.
         run_ids.sort(reverse=True)
-        resolve_keys = [rid for _, rid in run_ids]
-        if session_key and session_key not in resolve_keys:
-            resolve_keys.append(session_key)
+        # (park_key, request_id_is_strict): run-scoped leg uses the authoritative park key and
+        # FIFO (no request_id); session fallback leg keeps request_id strict.
+        resolve_legs = [
+            (self._run_approval_sessions.get(rid) or rid, False)
+            for _, rid in run_ids
+        ]
+        if session_key and not any(k == session_key for k, _ in resolve_legs):
+            resolve_legs.append((session_key, True))
         try:
-            from tools.approval import resolve_gateway_approval
             resolved = 0
-            for rkey in resolve_keys:
+            for rkey, strict_rid in resolve_legs:
                 try:
                     n = await asyncio.to_thread(
                         resolve_gateway_approval, rkey, choice,
                         resolve_all=body.get("resolve_all") is True,
                         reason=(reason if isinstance(reason, str) and reason else None),
-                        request_id=(request_id if isinstance(request_id, str) and request_id else None))
+                        request_id=((request_id if isinstance(request_id, str) and request_id else None)
+                                    if strict_rid else None))
                 except Exception:
                     n = 0
                 resolved += n
                 if resolved > 0:
                     break
+            if resolved == 0:
+                # Fail-open diagnostic: name the actual parked queue keys and run statuses so a
+                # future hard-stop names the real park key instead of guessing (see fusion H1-H4).
+                logger.warning(
+                    "[api_server] session approval resolve 0: session=%s legs=%s runs=%s",
+                    session_id, resolve_legs,
+                    {rid: st.get("status") for rid, st in list(self._run_statuses.items())[:40]})
         except Exception as exc:
             return _error_response(_redact_api_error_text(exc), 500, code="approval_resolve_failed")
         return web.json_response({"object": "approval", "session_id": session_id, "resolved": resolved})
