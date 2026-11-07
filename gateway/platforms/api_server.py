@@ -4207,21 +4207,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         choice = choice_map.get(choice, choice)
         request_id = body.get("request_id")
         reason = body.get("reason")
-        # The native session-stream approval gate parks its pending under the RUN id:
-        # _run_agent._run() re-enters set_current_session_key(approval_session_key=run_id)
-        # in the executor worker (the approval gate reads it there), and registers its notify
-        # under that key. Mercury resolves via this /api/sessions route and sends no
-        # X-Hermes-Session-Key, so a plain session_key would miss the run-scoped entry and
-        # resolve 0 even though the card rendered. The authoritative run -> park-key map is
-        # _run_approval_sessions (the same map the proven /v1/runs/{id}/approval path uses);
-        # derive each active run of this session's park key from it, never assume the park key
-        # equals run_id by guessing from a non-contract _run_statuses session_id stamp. Run
-        # keys are turn-unique, so resolve them FIFO WITHOUT request_id (a bad client-echoed
-        # request_id must not zero a correctly-keyed resolve). Keep request_id strict only for
-        # the shared gateway-session-key fallback, where concurrent turns can coexist and the
-        # id is the correct disambiguator.
+        # The native session-stream approval gate parks its pending under the SESSION key the
+        # tool-executor worker resolves — the QUALIFIED gateway session key (e.g.
+        # ``agent:main:api_server:dm:<session_id>``, from get_current_session_key() ->
+        # HERMES_SESSION_KEY). It is NOT the run_id: ``_run_agent._run()`` binds
+        # set_current_session_key(run_id), but ContextVars do not cross into the tool-executor
+        # worker, so the gate reads the session key instead (live diagnostic: _gateway_queues
+        # keyed `agent:main:api_server:dm:<sid>` while run_id is waiting_for_approval).
+        # Mercury sends no X-Hermes-Session-Key, so session_key above is the raw session_id,
+        # which misses the qualified key. Resolve against the *actual* _gateway_queues keys that
+        # belong to this session (producer's key, per prior-art: derive, never guess), resolved
+        # with strict request_id (session-scoped keys are shared by concurrent turns, so the id
+        # is the disambiguator). Also keep the run-scoped legs (FIFO, no request_id) and the raw
+        # session_id fallback for header-carrying clients.
         from gateway.platforms.api_server_runs import TERMINAL_STATUSES
-        from tools.approval import resolve_gateway_approval
+        from tools.approval import resolve_gateway_approval, gateway_queue_keys
         run_ids = []
         for run_id, status in self._run_statuses.items():
             if status.get("session_id") != session_id:
@@ -4231,14 +4231,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             run_ids.append((status.get("created_at") or 0.0, run_id))
         # Newest active run first.
         run_ids.sort(reverse=True)
-        # (park_key, request_id_is_strict): run-scoped leg uses the authoritative park key and
-        # FIFO (no request_id); session fallback leg keeps request_id strict.
-        resolve_legs = [
+        # (park_key, request_id_is_strict):
+        #   run-scoped leg — authoritative map, FIFO (no request_id; turn-unique key is safe).
+        run_legs = [
             (self._run_approval_sessions.get(rid) or rid, False)
             for _, rid in run_ids
         ]
-        if session_key and not any(k == session_key for k, _ in resolve_legs):
-            resolve_legs.append((session_key, True))
+        #   session-scoped legs — the producer's actual queue keys for this session (the
+        #   qualified gateway session key and the raw session_id), strict request_id per prior-art.
+        session_legs = []
+        for qk in gateway_queue_keys():
+            if qk == session_key or qk.endswith(":" + session_id):
+                if qk not in [k for k, _ in session_legs]:
+                    session_legs.append((qk, True))
+        if session_key and not any(k == session_key for k, _ in session_legs):
+            session_legs.append((session_key, True))
+        resolve_legs = run_legs + [l for l in session_legs if not any(k == l[0] for k, _ in run_legs)]
         try:
             resolved = 0
             for rkey, strict_rid in resolve_legs:

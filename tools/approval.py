@@ -232,6 +232,18 @@ def pending_gateway_approval_count() -> int:
         return sum(len(queue) for queue in _gateway_queues.values())
 
 
+def gateway_queue_keys() -> list[str]:
+    """Snapshot of the keys currently holding pending gateway approvals (read-only).
+
+    Lets a resolver discover the identifier a gate actually parked an approval under,
+    instead of guessing it. The queue keys are the producer's session keys (e.g. a
+    qualified ``agent:<ns>:<platform>:dm:<chat_id>``), which can differ from a natural
+    ``session_id`` — the exact divergence that turns an approval into an unresolvable 0.
+    """
+    with _lock:
+        return list(_gateway_queues.keys())
+
+
 def get_pending_gateway_approval(session_key: str) -> dict | None:
     """Copy of the oldest unresolved gateway approval, for reconnecting clients
     to restore a prompt. Read-only snapshot — the queue stays authoritative."""
