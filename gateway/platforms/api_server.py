@@ -4241,7 +4241,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         #   qualified gateway session key and the raw session_id), strict request_id per prior-art.
         session_legs = []
         for qk in gateway_queue_keys():
-            if qk == session_key or qk.endswith(":" + session_id):
+            if qk == session_key or (session_id and qk.endswith(":dm:" + session_id)):
                 if qk not in [k for k, _ in session_legs]:
                     session_legs.append((qk, True))
         if session_key and not any(k == session_key for k, _ in session_legs):
