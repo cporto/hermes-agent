@@ -1105,7 +1105,8 @@ class OpenAICompatRoutesMixin:
         """Stream ``chat.completion.chunk`` frames from the agent's delta queue. On client
         disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled."""
         from gateway.platforms.api_server import (
-            _abandon_agent_task, _chat_usage_payload, _resolve_media_to_data_urls, _sse_frame)
+            _abandon_agent_task, _chat_usage_payload, _resolve_media_to_data_urls, _sse_frame,
+            _MediaStreamBuffer)
         response = await self._prepare_sse_response(request, session_id, gateway_session_key)
 
         def _chunk(delta: dict[str, Any], finish_reason=None, **extra) -> dict[str, Any]:
@@ -1113,6 +1114,7 @@ class OpenAICompatRoutesMixin:
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
         content_sent = False
+        media_buf = _MediaStreamBuffer()
         try:
             await response.write(_sse_frame(_chunk({"role": "assistant"})))
             async for delta in _iter_stream_items(stream_q, agent_task, response):
@@ -1134,7 +1136,13 @@ class OpenAICompatRoutesMixin:
                 else:
                     if delta:
                         content_sent = True
-                    await response.write(_sse_frame(_chunk({"content": delta})))
+                    emitted = media_buf.push(delta)
+                    if emitted:
+                        await response.write(_sse_frame(_chunk({"content": emitted})))
+            # Flush a MEDIA: tag held back across chunk boundaries once the stream ends (#136892).
+            remaining = media_buf.flush()
+            if remaining:
+                await response.write(_sse_frame(_chunk({"content": remaining})))
             # The agent can fail after the queue drains (task raises / result flagged failed or
             # partial): surface a non-"stop" finish_reason like the non-streaming path.
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}

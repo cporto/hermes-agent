@@ -864,6 +864,50 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return text
 
 
+class _MediaStreamBuffer:
+    """Reassemble a ``MEDIA:`` tag that arrives split across multiple streamed content
+    deltas so it is resolved as one unit, mirroring the non-streaming inlining behavior.
+    A trailing ``MEDIA:`` token that may still be mid-path is held back until it is
+    terminated; everything before it is returned (its media tags already inlined)."""
+
+    __slots__ = ("_buf",)
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def push(self, delta: str) -> str:
+        """Append one content delta; return the safe-to-emit prefix, resolved to data URLs.
+
+        A token begun after the last complete match may still be split mid-path, so it is
+        held in the buffer; once it is terminated (or the stream ends and flush() runs) it
+        is resolved exactly like the non-streaming path.
+        """
+        if not delta:
+            return ""
+        self._buf += delta
+        last_media = self._buf.rfind("MEDIA:")
+        if last_media < 0:
+            out, self._buf = self._buf, ""
+            return _resolve_media_to_data_urls(out)
+        last_complete_end = 0
+        for m in MEDIA_TAG_CLEANUP_RE.finditer(self._buf):
+            last_complete_end = m.end()
+        if last_media >= last_complete_end:
+            out, self._buf = self._buf[:last_media], self._buf[last_media:]
+        else:
+            out, self._buf = self._buf, ""
+        if "MEDIA:" in out:
+            return _resolve_media_to_data_urls(out)
+        return out
+
+    def flush(self) -> str:
+        """Emit whatever remains (call once when the stream ends)."""
+        out, self._buf = self._buf, ""
+        if "MEDIA:" in out:
+            return _resolve_media_to_data_urls(out)
+        return out
+
+
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
     redacted = redact_sensitive_text(str(value), force=True)

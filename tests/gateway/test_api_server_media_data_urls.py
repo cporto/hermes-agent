@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("aiohttp")
 
-from gateway.platforms.api_server import _resolve_media_to_data_urls
+from gateway.platforms.api_server import _MediaStreamBuffer, _resolve_media_to_data_urls
 
 # 1x1 transparent PNG
 _PNG_BYTES = base64.b64decode(
@@ -56,6 +56,43 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
     def test_non_image_left_untouched(self):
         text = "MEDIA:/tmp/archive.zip"
         self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+
+class TestMediaStreamHoldback(unittest.TestCase):
+    def _write_png(self):
+        import tempfile
+        from pathlib import Path
+        d = Path(tempfile.mkdtemp(prefix="hermes_media_stream"))
+        p = d / "shot.png"
+        p.write_bytes(_PNG_BYTES)
+        return p
+
+    def test_tag_split_across_deltas_reassembled(self):
+        """A MEDIA: tag split mid-path across two deltas is held back and only emitted as a
+        resolved data URL once complete, mirroring the non-streaming path."""
+        p = self._write_png()
+        stem = p.with_suffix("").name
+        ext = p.suffix
+        buf = _MediaStreamBuffer()
+        first = buf.push(f"result: MEDIA:{p.parent}/")
+        self.assertNotIn("MEDIA:", first)
+        second = buf.push(f"{stem}{ext}")
+        self.assertIn("data:image/png;base64,", first + second)
+        self.assertNotIn("MEDIA:", first + second)
+        self.assertEqual(buf.flush(), "")
+
+    def test_tag_fully_in_one_delta(self):
+        p = self._write_png()
+        buf = _MediaStreamBuffer()
+        out = buf.push(f"Here: MEDIA:{p}")
+        self.assertIn("data:image/png;base64,", out)
+        self.assertNotIn("MEDIA:", out)
+        self.assertEqual(buf.flush(), "")
+
+    def test_plain_text_unchanged(self):
+        buf = _MediaStreamBuffer()
+        self.assertEqual(buf.push("just plain text"), "just plain text")
+        self.assertEqual(buf.flush(), "")
 
 
 if __name__ == "__main__":
