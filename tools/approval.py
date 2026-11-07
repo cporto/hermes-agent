@@ -806,7 +806,15 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     from agent.redact import redact_sensitive_text
 
     smart_denied = False
-    if smart:
+    # An opted-in interactive api_server session (Mercury's approval card) means a real
+    # human can answer the ApprovalCard. Never let the smart guardian auto-approve there —
+    # always fall through to the human card/veto so a flagged command is surfaced for consent.
+    # Gated on the api-interactive opt-in (not the generic is_gateway flag) so ordinary
+    # gateway sessions keep the smart-DENY circuit breaker; also require the notify callback
+    # to be registered so we never park an unanswerable pending approval on a key mismatch.
+    human_can_answer_card = (approval_context._is_api_interactive_approval_opted_in()
+                             and _gateway_notify_cb(session_key) is not None)
+    if smart and not human_can_answer_card:
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
                                            session_key, human_present=is_cli or is_gateway or is_ask)
         if result is not None:
