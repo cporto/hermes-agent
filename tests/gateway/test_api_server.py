@@ -1265,6 +1265,54 @@ class TestChatCompletionsEndpoint:
 
 
     @pytest.mark.asyncio
+    async def test_stream_media_tag_split_across_deltas_inlined(self, adapter):
+        """A MEDIA:<path> tag split across two streamed content deltas is held back and emitted
+        as a single inline base64 data URL, not forwarded verbatim (regression: streaming chat
+        completions previously leaked the raw host path to remote frontends as a download)."""
+        import base64
+        import tempfile
+        from pathlib import Path
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
+            "h6FO1AAAAABJRU5ErkJggg=="
+        )
+        d = Path(tempfile.mkdtemp(prefix="hermes_api_stream_media"))
+        p = d / "shot.png"
+        p.write_bytes(png)
+        stem = p.with_suffix("").name
+        ext = p.suffix
+
+        async def _mock_run_agent(**kwargs):
+            cb = kwargs.get("stream_delta_callback")
+            if cb:
+                cb(f"result: MEDIA:{p.parent}/")   # partial tag, split mid-path
+                cb(f"{stem}{ext}")                  # completes the path
+            return (
+                {"final_response": f"result: MEDIA:{p}", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "show me"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "[DONE]" in body
+                # The tag must arrive as an inline data URL, never the raw host path.
+                assert "data:image/png;base64," in body
+                assert "MEDIA:/" not in body
+                assert str(p) not in body
+
+    @pytest.mark.asyncio
     async def test_stream_emits_tool_lifecycle_with_call_id(self, adapter):
         """Regression for #16588.
 
