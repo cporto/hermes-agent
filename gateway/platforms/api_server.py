@@ -5382,6 +5382,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         request_profile = _api_request_profile.get()
         request_browser_control_principal = _api_request_browser_control_principal.get()
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
+        # The api-interactive-approval opt-in (Mercury's ApprovalCard) is bound on the loop
+        # thread in _run_and_signal(); it must be re-entered in the _run() executor worker
+        # because the approval gate (check_*_guards -> _human_decision) runs there and reads
+        # _is_api_interactive_approval_opted_in(). Without this the smart-auto-approve skip
+        # never fires and the human card is bypassed (see #approval-card-thread).
+        from tools.approval_context import _is_api_interactive_approval_opted_in
+        request_interactive_approval = _is_api_interactive_approval_opted_in()
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -5450,10 +5457,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         from tools.approval_context import set_current_session_key
                         approval_token = set_current_session_key(approval_session_key)
                         register_gateway_notify(approval_session_key, approval_notify_callback)
+                    optin_token = None
+                    if request_interactive_approval:
+                        from tools.approval_context import set_api_interactive_approval
+                        optin_token = set_api_interactive_approval(True)
                     try:
                         with notification_turn(agent, muted=muted, session_id=session_id or ""):
                             result = agent.run_conversation(**conversation_kwargs)
                     finally:
+                        if optin_token is not None:
+                            from tools.approval_context import reset_api_interactive_approval
+                            with suppress(Exception):
+                                reset_api_interactive_approval(optin_token)
                         if approval_token is not None:
                             from tools.approval_context import reset_current_session_key
                             _api_runs._unregister_approval_notify(approval_session_key)

@@ -2219,3 +2219,57 @@ class TestSmartSkipForOptedInInteractiveApi:
 
         assert called, "smart gate should still run without the opt-in"
         assert result.get("smart_approved") is True
+
+    def test_opted_in_is_visible_across_executor_boundary(self, monkeypatch):
+        """Thread-faithful: production binds the opt-in on the event-loop thread but
+        runs the approval gate in a run_in_executor worker thread (which drops
+        contextvars). Edit 2 re-binds the opt-in inside the worker before
+        agent.run_conversation; this test mirrors that re-bind and proves the gate
+        then skips the smart guardian and fires the human card."""
+        import asyncio
+        from tools import approval as mod
+
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+
+        self._cfg_smart(monkeypatch)
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", False)
+
+        def _boom(*a, **k):
+            raise AssertionError("_smart_gate should NOT run for an opted-in worker")
+        monkeypatch.setattr(mod, "_smart_gate", _boom)
+
+        saved = self._env()
+        notified = []
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
+        def _fake_await(session_key, notify_cb, data, surface):
+            if notify_cb is not None:
+                notify_cb(data)
+            return {"choice": "once", "resolved": True}
+        monkeypatch.setattr(mod, "_await_gateway_decision", _fake_await)
+
+        async def _main():
+            loop = asyncio.get_running_loop()
+            def _worker():
+                # Mirror Edit 2: re-bind the opt-in INSIDE the worker thread (the
+                # contextvar set on the loop thread is invisible here otherwise).
+                token = approval_context.set_api_interactive_approval(True)
+                try:
+                    return mod.check_all_command_guards("chmod 777 /tmp/hermes_thread_probe.txt", "local")
+                finally:
+                    approval_context.reset_api_interactive_approval(token)
+            return await loop.run_in_executor(None, _worker)
+
+        result = asyncio.run(_main())
+        self._restore_env(saved)
+        mod._gateway_notify_cbs.clear()
+        mod._gateway_queues.clear()
+
+        # With the opt-in visible in the worker (as Edit 2 guarantees), _smart_gate is
+        # skipped (boom not raised), the human notify card fires, and the verdict comes
+        # from the 'once' resolution (approved, NOT smart_approved).
+        assert result.get("smart_approved") is not True
+        assert result["approved"] is True
+        assert notified, "gateway notify callback should have fired (card surfaced)"
