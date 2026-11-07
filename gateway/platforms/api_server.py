@@ -4255,12 +4255,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 if resolved > 0:
                     break
             if resolved == 0:
-                # Fail-open diagnostic: name the actual parked queue keys and run statuses so a
-                # future hard-stop names the real park key instead of guessing (see fusion H1-H4).
-                logger.warning(
-                    "[api_server] session approval resolve 0: session=%s legs=%s runs=%s",
-                    session_id, resolve_legs,
-                    {rid: st.get("status") for rid, st in list(self._run_statuses.items())[:40]})
+                # Fail-open diagnostic: name the actual parked queue keys + notify keys +
+                # each pending entry's request_id so a hard-stop names the real park key
+                # instead of guessing (see fusion H1-H4; the run leg resolving 0 on an active
+                # waiting_for_approval run proved the park key is not run_id).
+                try:
+                    from tools import approval as _approval
+                    _qkeys = list(_approval._gateway_queues.keys())
+                    _nkeys = list(_approval._gateway_notify_cbs.keys())
+                    _qdetail = {
+                        k: [dict(e.data) for e in v] for k, v in _approval._gateway_queues.items()
+                    }
+                    logger.warning(
+                        "[api_server] session approval resolve 0: session=%s legs=%s qkeys=%s notify=%s q=%s runs=%s",
+                        session_id, resolve_legs, _qkeys, _nkeys, _qdetail,
+                        {rid: st.get("status") for rid, st in list(self._run_statuses.items())[:40]})
+                except Exception as exc2:
+                    logger.warning("[api_server] session approval resolve 0 diag failed: %r", exc2)
         except Exception as exc:
             return _error_response(_redact_api_error_text(exc), 500, code="approval_resolve_failed")
         return web.json_response({"object": "approval", "session_id": session_id, "resolved": resolved})
