@@ -84,6 +84,7 @@ def run_projection(adapter, run_id):
             # The run SSE's own mapper: a `partial` or `completed: false` turn (iteration
             # budget, truncation) settles with outcome `completed` but is a failed run there,
             # so polling must not report `completed` for the same receipt.
+            from gateway.platforms.api_server import _resolve_media_to_data_urls
             from gateway.platforms.api_server_runs import terminal_run_status
             status = terminal_run_status(result)[0]
     pending = []
@@ -94,7 +95,7 @@ def run_projection(adapter, run_id):
             status = 'waiting_for_approval'  # the documented run state main's run store reports
     return {'pending_controls': pending, 'run_id': run_id, 'status': status, 'session_id': row['target_session_id'],
             'admission_id': row['admission_id'], 'execution_generation': row['generation'],
-            'output': result.get('final_response', ''), 'usage': saved.get('usage', {}) if saved else {}}
+            'output': _resolve_media_to_data_urls(result.get('final_response', '')), 'usage': saved.get('usage', {}) if saved else {}}
 
 
 async def send_clarify(adapter, *, chat_id, **kwargs):
