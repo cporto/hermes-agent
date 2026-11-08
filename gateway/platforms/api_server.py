@@ -2029,6 +2029,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
+        # Mercury saved-prompts — per-user durable store (survives client cache clears).
+        # Single-user gateway: no per-key scoping needed; auth via API key (mutable endpoint).
+        routes.append(("GET", "/v1/mercury/saved-prompts", self._handle_saved_prompts_get))
+        routes.append(("PUT", "/v1/mercury/saved-prompts", self._handle_saved_prompts_put))
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
@@ -3391,6 +3395,56 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("GET /v1/skills failed")
             return _error_response("Failed to enumerate skills", 500, err_type="server_error")
         return web.json_response({"object": "list", "data": skills})
+
+    # -- Mercury saved-prompts (per-user durable store) --------------------------------
+    # Saved composer prompts normally live in client localStorage, so a cache/site-data
+    # clear wipes them. Keep them server-side in <hermes_home>/mercury_saved_prompts.json
+    # on the single-user gateway so they survive any client storage clear. Both endpoints
+    # require the API key (mutable + exposes user data). JSON shape: {"prompts": [str,...]}.
+
+    def _saved_prompts_path(self) -> Path:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()) / "mercury_saved_prompts.json"
+
+    def _read_saved_prompts(self) -> list:
+        try:
+            p = self._saved_prompts_path()
+            if not p.exists():
+                return []
+            raw = json.loads(p.read_text("utf-8"))
+            arr = raw.get("prompts", raw) if isinstance(raw, dict) else raw
+            return [x for x in arr if isinstance(x, str)] if isinstance(arr, list) else []
+        except Exception:
+            logger.exception("read saved-prompts failed")
+            return []
+
+    @_require_auth
+    async def _handle_saved_prompts_get(self, request: web.Request) -> web.Response:
+        """GET /v1/mercury/saved-prompts — the user's saved prompts (auth required)."""
+        return web.json_response({"prompts": self._read_saved_prompts()})
+
+    @_require_auth
+    async def _handle_saved_prompts_put(self, request: web.Request) -> web.Response:
+        """PUT /v1/mercury/saved-prompts — replace the user's saved prompts (auth required).
+        Body: {"prompts": [str, ...]}; bounded list size; atomic write to disk."""
+        try:
+            body = await request.json()
+        except Exception:
+            return _error_response("Expected a JSON body: {\"prompts\": [...]}", 400)
+        prompts = body.get("prompts") if isinstance(body, dict) else None
+        if not isinstance(prompts, list) or not all(isinstance(x, str) for x in prompts):
+            return _error_response("'prompts' must be a JSON array of strings", 400)
+        prompts = prompts[:500]
+        path = self._saved_prompts_path()
+        try:
+            os.makedirs(path.parent, mode=0o700, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps({"prompts": prompts}, indent=2), "utf-8")
+            os.replace(tmp, path)
+        except Exception:
+            logger.exception("PUT /v1/mercury/saved-prompts persist failed")
+            return _error_response("Failed to persist saved prompts", 500)
+        return web.json_response({"ok": True, "count": len(prompts)})
 
     def _widgets_enabled(self) -> bool:
         """A1 widget-publisher feature flag — additive + reversible. Defaults ON so the route
