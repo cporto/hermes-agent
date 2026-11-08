@@ -936,8 +936,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from tools.approval_context import reset_current_session_key, set_current_session_key
         ctx = self._ctx
         session_key = ctx.session_key or ""
-        token = set_current_session_key(session_key)
+        # An admitted API turn carries its turn-unique run_id (approval_session_key); the native
+        # producer binds it so the approval gate parks under run_id (resolved by the run-scoped
+        # FIFO leg). Fall back to the qualified session key for all other surfaces; register the
+        # notifier under both so the card renders and any park key is resolvable.
+        from gateway.session_api_turn import api_execution
+        api = api_execution.get()
+        approval_key = (api.get('approval_session_key') if api else None) or session_key
+        token = set_current_session_key(approval_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
+        if approval_key != session_key:
+            register_gateway_notify(approval_key, self._approval_notify_sync)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
@@ -987,6 +996,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             return result
         finally:
             unregister_gateway_notify(session_key)
+            if approval_key != session_key:
+                unregister_gateway_notify(approval_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.
             with suppress(Exception):

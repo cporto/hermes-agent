@@ -55,8 +55,9 @@ def check_api_turn(authority, ref, payload):
     if 'api_turn_v1' in payload:
         data = payload['api_turn_v1']
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered'}
+                         'relay_metadata', 'resume_unanswered', 'approval_session_key'}
                 or data.get('resume_unanswered', True) is not True
+                or ('approval_session_key' in data and not isinstance(data['approval_session_key'], str))
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
@@ -195,8 +196,15 @@ def admit_api_steps(adapter, **kwargs):
         if configured != route:
             raise RuntimeStoreError('permission_denied')
         settings['route'] = {k: v for k, v in route.items() if k != 'api_key'}
-    payload = json.loads(_json({'text': kwargs['user_message'], 'api_turn_v1': {
-        'history': None if kwargs.get('history_from_session') else kwargs['conversation_history'], 'settings': settings}}))
+    _turn_v1 = {
+        'history': None if kwargs.get('history_from_session') else kwargs['conversation_history'],
+        'settings': settings,
+    }
+    _approval_key = kwargs.get('approval_session_key')
+    if _approval_key:
+        # Turn-unique run_id for the native producer to bind; only when a turn carries one.
+        _turn_v1['approval_session_key'] = _approval_key
+    payload = json.loads(_json({'text': kwargs['user_message'], 'api_turn_v1': _turn_v1}))
     run_owner_scope = kwargs.get('run_owner_scope')
     if run_owner_scope is not None:
         if not _valid_owner_scope(run_owner_scope):
@@ -409,7 +417,13 @@ async def _persist_turn_usage(adapter, admitted, usage):
 
 async def run_api_turn(adapter, *, approval_notify_callback=None, approval_session_key=None,
                        clarify_notify_callback=None, **kwargs):
-    admitted = await admit_api_turn_async(adapter, **kwargs)
+    admitted = await admit_api_turn_async(
+        adapter,
+        # Thread the turn-unique run_id (approval_session_key) into the admission payload so the
+        # native/TurnRunner producer parks gateway approvals under run_id, resolved FIFO by the
+        # run-scoped leg. The resolver alias below keeps /v1/runs/{id}/approval working unchanged.
+        approval_session_key=(approval_session_key if (approval_notify_callback is not None and approval_session_key) else None),
+        **kwargs)
     has_approval = approval_notify_callback is not None and approval_session_key
     if not has_approval and clarify_notify_callback is None:
         result, usage = await observe_api_turn(admitted, **kwargs)
@@ -560,7 +574,9 @@ def prepare_api_execution(authority, ref, payload):
             'content': content, 'turn_author': data.get('turn_author') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
             'resume_unanswered': bool(data and data.get('resume_unanswered')),
-            'browser_control': _rebind_browser_control(adapter, data)}
+            'browser_control': _rebind_browser_control(adapter, data),
+            'approval_session_key': data.get('approval_session_key') if data else None,
+}
 
 
 def _api_observers(authority, session_id):
