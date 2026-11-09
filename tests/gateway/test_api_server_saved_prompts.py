@@ -54,6 +54,12 @@ async def test_saved_prompts_validation(tmp_path):
         assert r.status == 400, await r.text()
         r = await cli.put("/v1/mercury/saved-prompts", json={"prompts": "nope"})
         assert r.status == 400, await r.text()
+        # Oversized single entry (over _SAVED_PROMPT_MAX_LEN) -> 400.
+        r = await cli.put(
+            "/v1/mercury/saved-prompts",
+            json={"prompts": ["x" * (adapter._SAVED_PROMPT_MAX_LEN + 1)]},
+        )
+        assert r.status == 400, await r.text()
         # After failed writes the store is still empty (no partial write).
         r = await cli.get("/v1/mercury/saved-prompts")
         assert (await r.json())["prompts"] == []

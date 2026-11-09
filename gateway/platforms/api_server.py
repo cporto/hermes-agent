@@ -23,6 +23,7 @@ import re
 import sqlite3
 import stat
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -2030,7 +2031,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         # Mercury saved-prompts — per-user durable store (survives client cache clears).
-        # Single-user gateway: no per-key scoping needed; auth via API key (mutable endpoint).
+        # Auth via the API key (mutable endpoint). Storage is intentionally a single
+        # global <hermes_home>/mercury_saved_prompts.json for the default single-user
+        # profile; on a multiplexed gateway the handler resolves the profile home via
+        # the existing contextvar, so this stays per-profile without extra scoping.
         routes.append(("GET", "/v1/mercury/saved-prompts", self._handle_saved_prompts_get))
         routes.append(("PUT", "/v1/mercury/saved-prompts", self._handle_saved_prompts_put))
         routes.extend(_room_grants._http_routes(self))
@@ -3401,6 +3405,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # clear wipes them. Keep them server-side in <hermes_home>/mercury_saved_prompts.json
     # on the single-user gateway so they survive any client storage clear. Both endpoints
     # require the API key (mutable + exposes user data). JSON shape: {"prompts": [str,...]}.
+    _SAVED_PROMPT_MAX_LEN = 16_384  # per-prompt char cap (write AND read), anti-abuse.
 
     def _saved_prompts_path(self) -> Path:
         from hermes_constants import get_hermes_home
@@ -3413,10 +3418,30 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return []
             raw = json.loads(p.read_text("utf-8"))
             arr = raw.get("prompts", raw) if isinstance(raw, dict) else raw
-            return [x for x in arr if isinstance(x, str)] if isinstance(arr, list) else []
+            if not isinstance(arr, list):
+                return []
+            return [x for x in arr if isinstance(x, str) and len(x) <= self._SAVED_PROMPT_MAX_LEN]
         except Exception:
             logger.exception("read saved-prompts failed")
             return []
+
+    def _atomic_write_saved_prompts(self, path: Path, prompts: list) -> None:
+        """Atomic + durable write: unique temp file in the same dir, fsync, then
+        os.replace. On any failure the temp file is removed; never leaves a torn file."""
+        os.makedirs(path.parent, mode=0o700, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"prompts": prompts}, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
     @_require_auth
     async def _handle_saved_prompts_get(self, request: web.Request) -> web.Response:
@@ -3426,7 +3451,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_require_auth
     async def _handle_saved_prompts_put(self, request: web.Request) -> web.Response:
         """PUT /v1/mercury/saved-prompts — replace the user's saved prompts (auth required).
-        Body: {"prompts": [str, ...]}; bounded list size; atomic write to disk."""
+        Body: {\"prompts\": [str, ...]}; bounded list size AND per-item length; atomic write."""
         try:
             body = await request.json()
         except Exception:
@@ -3434,13 +3459,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         prompts = body.get("prompts") if isinstance(body, dict) else None
         if not isinstance(prompts, list) or not all(isinstance(x, str) for x in prompts):
             return _error_response("'prompts' must be a JSON array of strings", 400)
+        if any(len(x) > self._SAVED_PROMPT_MAX_LEN for x in prompts):
+            return _error_response(
+                f"'prompts' entries must be <= {self._SAVED_PROMPT_MAX_LEN} chars", 400
+            )
         prompts = prompts[:500]
-        path = self._saved_prompts_path()
         try:
-            os.makedirs(path.parent, mode=0o700, exist_ok=True)
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(json.dumps({"prompts": prompts}, indent=2), "utf-8")
-            os.replace(tmp, path)
+            self._atomic_write_saved_prompts(self._saved_prompts_path(), prompts)
         except Exception:
             logger.exception("PUT /v1/mercury/saved-prompts persist failed")
             return _error_response("Failed to persist saved prompts", 500)
