@@ -358,9 +358,11 @@ def recover_authority_api_turns(adapter, authority):
 
 
 async def _persist_context_usage(adapter, admitted, usage):
-    """Persist this session's last-known CURRENT context snapshot (used = the settled turn's
-    session_prompt_tokens, window = the model's context length) so a client can render a
-    used/window gauge on session load without a live turn. Best-effort: a metadata write must
+    """Persist this session's last-known CURRENT context snapshot (used = the producer's current
+    occupancy figure, window = the model's context length) so a client can render a used/window
+    gauge on session load without a live turn. The producer derives occupancy from the compressor
+    (last_prompt_tokens, clamped) -- never the cumulative billing sum -- and a value over the
+    window is clamped here so the gauge never reads >100%. Best-effort: a metadata write must
     never break a turn, so every failure is swallowed."""
     import logging
     import time
@@ -372,6 +374,7 @@ async def _persist_context_usage(adapter, admitted, usage):
         used = usage.get('context_used')
         if not used:
             return
+        used = max(0, int(used))
         window = int(usage.get('context_window') or 0)
         model = usage.get('model') or ''
         db = adapter._ensure_session_db()
@@ -384,6 +387,10 @@ async def _persist_context_usage(adapter, admitted, usage):
             window = int(await get_model_context_length_async(model) or 0)
         if window <= 0:
             return
+        # Current occupancy must never read over the model window (>100% gauge): clamp. The
+        # produced value is already the compressor's last_prompt_tokens (never the cumulative
+        # billing sum), where a running += would read false >100% on long sessions.
+        used = min(used, window)
         db.update_session_context_usage(
             session_id,
             {'used': used, 'window': window, 'model': model, 'updated_at': time.time()})

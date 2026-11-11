@@ -990,10 +990,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if captured is not None:
                 incoming = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
                 outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
-                _last = getattr(agent, '_last_turn_usage', None) or {}
+                # Current occupancy comes from the ONE authoritative helper (compressor
+                # last_prompt_tokens, clamped; {} when unknown) so the gauge never reads the
+                # cumulative billing sum (session_prompt_tokens) or a fabricated 0. context_used
+                # is omitted (None) when unknown -> _persist_context_usage omits rather than
+                # writing used=0. context_window rides the max so the persist clamp has the window.
+                from agent.context_breakdown import get_authoritative_occupancy
+                _occ = get_authoritative_occupancy(agent) or {}
                 captured['usage'] = {'input_tokens': incoming, 'output_tokens': outgoing,
                                      'total_tokens': incoming + outgoing,
-                                     'context_used': int(_last.get('prompt_tokens') or getattr(getattr(agent, 'context_compressor', None), 'last_prompt_tokens', 0) or 0)}
+                                     'context_used': _occ.get('context_used'),
+                                     'context_window': _occ.get('context_max') or 0}
                 _settle_api_runtime_lock(agent, result, captured)
             return result
         finally:

@@ -5512,11 +5512,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self, agent: Any, result: Any, session_id: Optional[str], *, route, requested_runtime, route_source,
         confirmed_runtime_lock: bool) -> tuple:
         """Attach usage, effective session id, ``_compressed`` and runtime metadata to a finished turn."""
-        _last = getattr(agent, "_last_turn_usage", None) or {}
+        # context_used is intentionally NOT derived here: it would couple the occupancy
+        # gauge to the cumulative billing sum -- the persist site sources CURRENT occupancy
+        # from get_authoritative_occupancy(agent) instead (compressor last_prompt_tokens,
+        # never session_prompt_tokens / input_tokens).
         usage = {"input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                  "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                 "context_used": int(_last.get("prompt_tokens") or getattr(getattr(agent, "context_compressor", None), "last_prompt_tokens", 0) or 0)}
+                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0}
         # Effective session id lets callers track compression-triggered rotations.
         # (#16938)
         _eff_sid = getattr(agent, "session_id", session_id)
@@ -5683,26 +5685,29 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     result, usage = self._finish_turn_result(
                         agent, result, session_id, route=route, requested_runtime=requested_runtime,
                         route_source=route_source, confirmed_runtime_lock=confirmed_runtime_lock)
-                    # Persist the last-known CURRENT context snapshot (used = this turn's
-                    # session_prompt_tokens, window = model context length) so clients can hydrate
-                    # a used/window gauge on session load without a live turn. Best-effort: a
-                    # metadata write must never break the turn.
+                    # Persist the last-known CURRENT context snapshot so clients can hydrate a
+                    # used/window gauge on session load without a live turn. Occupancy is sourced
+                    # from the authoritative compressor (get_authoritative_occupancy -> last_prompt_tokens,
+                    # clamped to the window), never the cumulative billing sum
+                    # (session_prompt_tokens / input_tokens) that reads false >100% on long sessions
+                    # or a frozen 0% occupancy. Best-effort: a metadata write must never break the turn.
                     try:
-                        _ctx_used = (usage or {}).get("context_used")
-                        if _ctx_used:
-                            _ctx_used = int(_ctx_used)
+                        from agent.context_breakdown import get_authoritative_occupancy
+                        _occ = get_authoritative_occupancy(agent) or {}
+                        _ctx_used = _occ.get("context_used")
+                        _ctx_win = int(_occ.get("context_max") or 0)
                         _ctx_model = getattr(agent, "model", None) or session_model or ""
-                        _ctx_win = 0
-                        if _ctx_model:
+                        if _ctx_win <= 0 and _ctx_model:
                             from agent.model_metadata import get_model_context_length
                             _ctx_win = int(get_model_context_length(_ctx_model) or 0)
                         _ctx_sid = getattr(agent, "session_id", None) or session_id
+                        # Empty occupancy or no window -> omit entirely (never write used=0).
                         if _ctx_used and _ctx_sid and _ctx_win > 0:
                             _ctx_db = self._ensure_session_db()
                             if _ctx_db is not None:
                                 _ctx_db.update_session_context_usage(
                                     _ctx_sid,
-                                    {"used": _ctx_used, "window": _ctx_win,
+                                    {"used": int(_ctx_used), "window": _ctx_win,
                                      "model": _ctx_model, "updated_at": time.time()},
                                 )
                     except Exception:

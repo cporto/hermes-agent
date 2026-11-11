@@ -140,6 +140,35 @@ def context_usage_fields(compressor: Any) -> dict[str, Any]:
             "context_source": source, "context_estimated": source != "provider_usage"}
 
 
+def get_authoritative_occupancy(agent) -> dict:
+    """Current context occupancy from the authoritative source (the live compressor's
+    ``last_prompt_tokens``, clamped to the context window), never the cumulative billing sum
+    (``session_prompt_tokens`` / ``input_tokens``). Precedence:
+
+    - the live ``agent.context_compressor`` via ``context_usage_fields`` (returns {} when unknown,
+      clamps used to the window) — the same source the TUI gauge uses; then
+    - ``agent._last_turn_usage['prompt_tokens']`` clamped to the window; then
+    - unknown -> {} (omit, never 0).
+
+    ``context_usage_fields`` already clamps used to maximum, so a single prompt can never read as
+    more than the window."""
+    comp = getattr(agent, "context_compressor", None)
+    if comp is not None:
+        fields = context_usage_fields(comp)
+        if fields:
+            return fields
+    last = getattr(agent, "_last_turn_usage", None) or {}
+    used = last.get("prompt_tokens")
+    if used:
+        used = max(0, int(used))
+        maximum = int(getattr(comp, "context_length", 0) or 0) or int(getattr(agent, "context_length", 0) or 0)
+        if maximum > 0 and used > 0:
+            used = min(used, maximum)
+            return {"context_used": used, "context_max": maximum,
+                    "context_percent": max(0, min(100, round(used / maximum * 100)))}
+    return {}
+
+
 def compute_session_context_breakdown(agent: Any, messages: Optional[list[dict]] = None) -> dict[str, Any]:
     """Return a Cursor-style context usage breakdown for one live agent."""
     from agent.model_metadata import estimate_messages_tokens_rough
