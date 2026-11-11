@@ -369,7 +369,9 @@ async def _persist_context_usage(adapter, admitted, usage):
         session_id = getattr(ref, 'session_id', None)
         if not session_id or not isinstance(usage, dict):
             return
-        used = int(usage.get('context_used') or 0)
+        used = usage.get('context_used')
+        if not used:
+            return
         window = int(usage.get('context_window') or 0)
         model = usage.get('model') or ''
         db = adapter._ensure_session_db()

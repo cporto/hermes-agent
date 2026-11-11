@@ -5688,14 +5688,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # a used/window gauge on session load without a live turn. Best-effort: a
                     # metadata write must never break the turn.
                     try:
-                        _ctx_used = int((usage or {}).get("context_used") or 0)
+                        _ctx_used = (usage or {}).get("context_used")
+                        if _ctx_used:
+                            _ctx_used = int(_ctx_used)
                         _ctx_model = getattr(agent, "model", None) or session_model or ""
                         _ctx_win = 0
                         if _ctx_model:
                             from agent.model_metadata import get_model_context_length
                             _ctx_win = int(get_model_context_length(_ctx_model) or 0)
                         _ctx_sid = getattr(agent, "session_id", None) or session_id
-                        if _ctx_sid and _ctx_win > 0:
+                        if _ctx_used and _ctx_sid and _ctx_win > 0:
                             _ctx_db = self._ensure_session_db()
                             if _ctx_db is not None:
                                 _ctx_db.update_session_context_usage(
