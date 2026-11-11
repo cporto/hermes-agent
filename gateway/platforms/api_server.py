@@ -5512,9 +5512,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self, agent: Any, result: Any, session_id: Optional[str], *, route, requested_runtime, route_source,
         confirmed_runtime_lock: bool) -> tuple:
         """Attach usage, effective session id, ``_compressed`` and runtime metadata to a finished turn."""
+        _last = getattr(agent, "_last_turn_usage", None) or {}
         usage = {"input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                  "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0}
+                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                 "context_used": int(_last.get("prompt_tokens") or getattr(getattr(agent, "context_compressor", None), "last_prompt_tokens", 0) or 0)}
         # Effective session id lets callers track compression-triggered rotations.
         # (#16938)
         _eff_sid = getattr(agent, "session_id", session_id)
@@ -5686,7 +5688,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # a used/window gauge on session load without a live turn. Best-effort: a
                     # metadata write must never break the turn.
                     try:
-                        _ctx_used = int((usage or {}).get("input_tokens") or 0)
+                        _ctx_used = int((usage or {}).get("context_used") or 0)
                         _ctx_model = getattr(agent, "model", None) or session_model or ""
                         _ctx_win = 0
                         if _ctx_model:
