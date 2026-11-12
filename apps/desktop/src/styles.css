@@ -1895,10 +1895,7 @@ body.guest-pointer-lock :is(webview, iframe) {
   overflow: hidden;
 }
 
-.sticky-human-clamp[data-clamped='true'] {
-  -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent);
-  mask-image: linear-gradient(to bottom, #000 55%, transparent);
-}
+
 
 /* Stick-to-bottom owns scrollTop while following. Once escaped, native anchoring
    is safe and keeps sticky human edits from shoving the viewport; data-editing
