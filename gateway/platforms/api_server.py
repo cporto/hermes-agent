@@ -3308,7 +3308,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         _ctx, err = self._artifact_route_prelude(request, "upload_f", check_enabled=False)
         if err is not None:
             return err
-        filename = request.headers.get("X-File-Filename", "").strip()
+        raw_filename = request.headers.get("X-File-Filename", "").strip()
+        # Mercury URL-encodes the client filename (encodeURIComponent) because a
+        # raw non-ASCII char (e.g. an em-dash) cannot live in an HTTP header - the
+        # browser throws a TypeError before any bytes are sent. Decode it back
+        # before slugging; fall back to raw on any malformed/missing value.
+        import urllib.parse
+        try:
+            filename = urllib.parse.unquote(raw_filename)
+        except Exception:
+            filename = raw_filename
         content_type = request.headers.get("Content-Type", "") or "application/octet-stream"
         safe_name = _sanitize_upload_base(filename)
         try:
