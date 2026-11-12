@@ -279,18 +279,20 @@ export function ChatSessionList({
         />
       )}
 
-      <Button
-        outlined
-        size="sm"
-        onClick={startNew}
-        prefix={<MessageSquarePlus />}
-        className="mx-2 mb-2 justify-center"
-      >
-        {t.sessions.newChat}
-      </Button>
-
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-1 pb-1">
         {content}
+      </div>
+
+      <div className="shrink-0 border-t border-current/10 px-2 pt-2">
+        <Button
+          outlined
+          size="sm"
+          onClick={startNew}
+          prefix={<MessageSquarePlus />}
+          className="w-full justify-center"
+        >
+          {t.sessions.newChat}
+        </Button>
       </div>
     </aside>
   );
