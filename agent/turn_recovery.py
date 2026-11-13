@@ -41,6 +41,27 @@ from utils import base_url_host_matches
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _provider_event(status, kind, model, provider="", base_url=""):
+    """Append a durable provider event (billing-402 / not-a-billing-failure) to the
+    same JSONL the Memento router writes, so the weekly vendor review + daily
+    tripwire can count main-chat billing walls. Best-effort, never raises."""
+    import os, json as _json, datetime as _dt
+    try:
+        path = os.path.join(os.path.expanduser("~"), ".hermes", "recovery", "provider-events.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(_json.dumps({
+                "ts": _dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "provider": provider or "",
+                "status": status,
+                "model": model or "",
+                "kind": kind,
+                "detail": "main-agent",  # distinguishes from memento-router events
+            }) + "\n")
+    except Exception:
+        pass
+
+
 def _runtime_uses_ascii_encoding() -> bool:
     """Return whether the process genuinely needs an ASCII-only request fallback."""
     encoding = locale.getpreferredencoding(False).strip().lower().replace("_", "-")
@@ -1208,6 +1229,7 @@ def max_retries_exhausted_result(
         _billing_block = _billing_block_dict(
             provider, base_url, model, _billing_guidance, unverified=_billing_unverified
         )
+        _provider_event("402", "billing-402", model, provider, base_url)
     else:
         # Every surface reads final_response (the 💡 lines above are CLI-only), so the chat
         # text carries the plain what-happened + next step itself.
