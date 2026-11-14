@@ -281,6 +281,27 @@ def has_pending(session_key: str) -> bool:
         return any(_entries.get(cid) is not None for cid in _session_index.get(session_key) or [])
 
 
+def find_session_keys_for_session_id(session_id: str) -> list[str]:
+    """All ``_session_index`` keys that address ``session_id``: the bare id and any
+    ``:dm:`` gateway-session variant registered for it. A session's clarify entries may
+    be indexed under either key depending on how the turn entered (an API continuation
+    binds the id, a peer/dm delivery binds ``<key>:dm:<id>``), so resolving 'pending
+    controls' or cancelling for a session must look across both, not just ``session_id``."""
+    with _lock:
+        return [k for k in _session_index
+                if k == session_id or k.endswith(':dm:' + session_id)]
+
+
+def cancel_pending_for_session(session_id: str) -> int:
+    """Cancel every pending clarify that addresses ``session_id`` (bare id and each
+    ``:dm:`` variant) so blocked agent threads don't freeze the session behind a stale
+    prompt; returns how many were cancelled. No-op when nothing is pending."""
+    cancelled = 0
+    for key in find_session_keys_for_session_id(session_id):
+        cancelled += clear_session(key)
+    return cancelled
+
+
 def clear_session(session_key: str) -> int:
     """Drop every pending clarify for a session (``/new``, shutdown, cached-agent eviction) so
     blocked agent threads don't outlive it; returns how many were cancelled. First-writer-wins: an already-set entry was answered for

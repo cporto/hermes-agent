@@ -4494,6 +4494,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # request path (/api/sessions/{session_id}/chat) — so a wake self-post lands where
             # the client will read it. The audited native-session opt-in.
             session_history_delivery="1", **agent_overrides)
+        # New-message session-turn admission: a stale pending clarify would otherwise block
+        # this session's agent thread on a prompt the user has moved past (anti-freeze).
+        # Drop any pending entry keyed to this session (bare id and :dm: variants) so the
+        # fresh turn runs instead of sitting behind the abandoned prompt; best-effort — a
+        # lock/registry hiccup must not fail the incoming message.
+        try:
+            from tools import clarify_gateway as _cmod
+            _cmod.cancel_pending_for_session(session_id)
+        except Exception:  # health: allow BLE001 -- clarify cancel is best-effort
+            logger.debug("cancel_pending_for_session failed for session %s", session_id, exc_info=True)
         return {
             "gateway_session_key": gateway_session_key, "session_id": session_id, "body": body,
             "user_message": user_message, "runtime_request": runtime_request,
@@ -5077,7 +5087,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from tools import clarify_gateway as _cmod
         gateway_key, _ = self._parse_session_key_header(request)
         entry = None
-        for key in (gateway_key, session_id):
+        # Resolve across every key that addresses this session: bare id, the gateway
+        # session key, and any ``:dm:`` variant registered in the index (a peer/dm turn
+        # may have indexed its pending clarify under ``<key>:dm:<id>``). A re-opened
+        # client must see the live prompt whichever key it was filed under.
+        resolve_keys = _cmod.find_session_keys_for_session_id(session_id)
+        for key in list(resolve_keys) + [gateway_key, session_id]:
             if not key:
                 continue
             entry = _cmod.get_pending_for_session(key, include_choice_prompts=True)
