@@ -749,9 +749,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.wake import deliver_wake, persist_delegation_delivery
         scope = contextlib.nullcontext()
         if evt.get("type") == "async_delegation":
-            info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
-            fail = "Async delegation delivery persist failed for session %s: %s"
-            deliver = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)
+            deliver, info, fail = await self._wake_or_persist_async_delegation(
+                adapter, synth_text, raw_sid, evt)
         else:
             info = "Watch pattern notification — waking api_server session %s via self-post"
             fail = "Watch notification self-post wake failed for session %s: %s"
@@ -777,6 +776,68 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         except Exception as e:
             logger.warning(fail, raw_sid, e)
             return False
+
+
+    async def _wake_or_persist_async_delegation(self, adapter, synth_text: str, raw_sid: str, evt: dict):
+        """Opt-in gated wake for an api_server async-delegation completion.
+
+        Default OFF (``delegation.auto_wake_completion`` false) => persist-only, the
+        long-standing #85957-safe baseline. When ON, wake via ``deliver_wake`` but ONLY
+        if EVERY gate passes (idle session, no pending human-confirmation, no active-turn
+        lease). Any denied or uncertain gate returns the persist path — an unguarded
+        self-post is never sent, because the api_server has no per-session lock
+        (last-writer-wins), so an intrusive wake could interleave a live conversation
+        or cross a pending approval.
+
+        Returns (deliver, info, fail) where ``deliver`` is the zero-arg async callable.
+        """
+        from gateway.wake import deliver_wake, persist_delegation_delivery
+        from tools.approval import list_gateway_approvals
+
+        persist = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)
+        info_p = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
+        fail_p = "Async delegation delivery persist failed for session %s: %s"
+
+        # Gate 1 — armed / opt-in (default OFF): the flag MUST be explicitly on.
+        try:
+            from tools.delegate_tool_config import _load_config
+            auto_wake = bool((_load_config() or {}).get("auto_wake_completion", False))
+        except Exception:
+            auto_wake = False
+        if not auto_wake:
+            return persist, info_p, fail_p
+
+        # Gate 2 — idle: never wake a session that holds an active turn (lease).
+        # last-writer-wins makes this load-bearing — an intrusive wake corrupts a live turn.
+        if raw_sid in (getattr(adapter, "_active_sessions", None) or {}):
+            return persist, info_p, fail_p
+
+        # Gate 3 — confirmation fallback (#85957): a pending human confirmation/approval
+        # (keyed by the same session key) must NOT be crossed by an autonomous wake; persist.
+        try:
+            if list_gateway_approvals(raw_sid):
+                return persist, info_p, fail_p
+        except Exception:
+            return persist, info_p, fail_p  # fail safe on any uncertainty
+
+        # Gates 4-6 — run in the owning profile scope; internal-notification marker so the
+        # wake is NOT a user deliverable / cannot re-trigger a new delegation turn; the cheap
+        # wake points at on-disk results rather than carrying the payload. ``deliver_wake``
+        # delivers in-process under ``profile`` (its own scope), matching the non-delegation
+        # branch's ``_async_profile_runtime_scope`` handling for served profiles.
+        served = None
+        try:
+            served = self._served_api_server_wake_profile(evt, raw_sid)
+        except LookupError as e:
+            logger.warning(fail_p, raw_sid, e)
+            return persist, info_p, fail_p
+
+        info = "Async delegation completion — waking api_server session %s (gated auto-wake)"
+        fail = "Async delegation auto-wake failed for session %s: %s"
+        deliver = (lambda: deliver_wake(
+            adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid, profile=served,
+            notification_category="result"))
+        return deliver, info, fail
 
     def _served_api_server_wake_profile(self, evt: dict, raw_sid: str) -> Optional[str]:
         """The served (non-primary) profile whose own session store holds *raw_sid*, else ``None``
