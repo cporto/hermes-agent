@@ -55,7 +55,7 @@ def check_api_turn(authority, ref, payload):
     if 'api_turn_v1' in payload:
         data = payload['api_turn_v1']
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered', 'approval_session_key'}
+                         'relay_metadata', 'resume_unanswered', 'approval_session_key', 'display_kind'}
                 or data.get('resume_unanswered', True) is not True
                 or ('approval_session_key' in data and not isinstance(data['approval_session_key'], str))
                 or not {'history', 'settings'} <= set(data)
