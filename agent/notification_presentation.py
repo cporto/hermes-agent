@@ -53,20 +53,20 @@ def notification_policy_snapshot(agent, platform, config):
 
 
 @contextmanager
-def notification_turn(agent, *, muted: bool, session_id: str = ""):
+def notification_turn(agent, *, muted: bool, session_id: str = "", display_kind: str = ""):
     """Freeze the current turn's presentation without touching prompts or tool schemas."""
-    if not muted:
-        yield
-        return
     missing = object()
-    keys = (*_PRESENTATION_CALLBACKS, "suppress_status_output", "_mute_notification_reply")
+    keys = (*_PRESENTATION_CALLBACKS, "suppress_status_output", "_mute_notification_reply",
+            "_notification_user_display_kind")
     saved = {key: getattr(agent, key, missing) for key in keys}
-    token = _muted_surface.set(session_id)
+    token = _muted_surface.set(session_id) if muted else None
     try:
-        for key in _PRESENTATION_CALLBACKS:
-            setattr(agent, key, None)
-        agent.suppress_status_output = True
-        agent._mute_notification_reply = True
+        agent._notification_user_display_kind = display_kind
+        if muted:
+            for key in _PRESENTATION_CALLBACKS:
+                setattr(agent, key, None)
+            agent.suppress_status_output = True
+            agent._mute_notification_reply = True
         yield
     finally:
         for key, value in saved.items():
@@ -74,4 +74,5 @@ def notification_turn(agent, *, muted: bool, session_id: str = ""):
                 delattr(agent, key)
             else:
                 setattr(agent, key, value)
-        _muted_surface.reset(token)
+        if token is not None:
+            _muted_surface.reset(token)

@@ -615,7 +615,8 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
 
 
 async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
-                                notification_category: str = "result", _api_server) -> None:
+                                notification_category: str = "result", display_kind: str = "",
+                                _api_server) -> None:
     """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key).
 
     The HTTP wake self-post cannot serve a multiplexed *served* profile: ``/p/<profile>/`` on
@@ -670,6 +671,7 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
                 gateway_session_key=None, **overrides, route=route, requested_runtime={},
                 route_source="global", session_history_delivery="1",
                 notification_category=notification_category,
+                notification_display_kind=display_kind,
             )
             return
         raise RuntimeError(

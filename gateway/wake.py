@@ -214,7 +214,8 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                 f"wake self-post for served profile {profile!r} requires in-process session "
                 "delivery; refusing to self-post as the default profile")
         await in_process(session_id=session_id, text=text, profile=str(profile),
-                         notification_category=notification_category)
+                         notification_category=notification_category,
+                         display_kind="internal_notification")
         return
     import aiohttp
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
@@ -234,6 +235,7 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                "messages": [{"role": "user", "content": text}], "stream": False}
     if notification_category == "diagnostic":
         payload["hermes_notification_category"] = "diagnostic"
+    payload["hermes_display_kind"] = "internal_notification"
     last_err: Optional[BaseException] = None
     attempts = 1 + len(_RETRY_DELAYS_SECONDS)
     for attempt in range(attempts):

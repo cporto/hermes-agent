@@ -313,6 +313,9 @@ def _db_flush_collect(agent, messages: list[dict], conversation_history: Optiona
             # context intact while transcript pollers omit unsolicited presentation.
             msg["display_kind"] = "hidden"
             msg["display_metadata"] = {**(msg.get("display_metadata") or {}), "notification_category": "diagnostic"}
+        notif_display_kind = getattr(agent, "_notification_user_display_kind", None)
+        if notif_display_kind and not is_history and msg.get("role") == "user" and not msg.get("display_kind"):
+            msg["display_kind"] = notif_display_kind
         if msg.get("role") == "tool" and not msg.get(TOOL_CALL_UID):
             # A result whose call was flushed in an earlier batch: pair it with the uid that assistant row
             # minted (same-batch pairing happens inside the insert).

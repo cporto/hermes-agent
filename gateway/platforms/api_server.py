@@ -422,6 +422,21 @@ def _project_steer_for_display(message: dict) -> dict | None:
     return projected
 
 
+def _project_internal_notification_for_display(message: dict) -> dict | None:
+    """For a display_kind=internal_notification row, strip the INTERNAL NOTIFICATION footer
+    marker from content for client display only. Returns a projected copy, or None if not a
+    notice row. Display-only: the model-facing replay path keeps the footer intact."""
+    if message.get("display_kind") != "internal_notification":
+        return None
+    from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER
+    content = message.get("content") or ""
+    if isinstance(content, str) and INTERNAL_NOTIFICATION_FOOTER in content:
+        content = content.replace(INTERNAL_NOTIFICATION_FOOTER, "").rstrip()
+    projected = {k: v for k, v in message.items()}
+    projected["content"] = content
+    return projected
+
+
 def _project_client_message(message: dict[str, Any]) -> dict[str, Any]:
     """Strip compaction scaffolding: standalone handoffs become hidden empty rows (stable
     ids), merged handoffs keep only the real prior-tail content; inherited tool calls dropped."""
@@ -430,6 +445,9 @@ def _project_client_message(message: dict[str, Any]) -> dict[str, Any]:
     _steer_projected = _project_steer_for_display(message)
     if _steer_projected is not None:
         return _steer_projected
+    _notice_projected = _project_internal_notification_for_display(message)
+    if _notice_projected is not None:
+        return _notice_projected
     if (message.get("display_kind") == "hidden"
             and (message.get("display_metadata") or {}).get("notification_category") == "diagnostic"):
         # Retain row identity and execution evidence in storage, not in the notification UI.
@@ -5568,6 +5586,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         request_id: Optional[str] = None, history_from_session: bool = False, run_owner_scope=None,
         session_history_delivery: str = "", turn_author: Optional[dict[str, Any]] = None,
         relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
+        notification_display_kind: str = "",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
         approval_session_key: Optional[str] = None, clarify_notify_callback=None,
         walked_from: Optional[str] = None) -> tuple:
@@ -5687,7 +5706,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         from tools.approval_context import set_api_interactive_approval
                         optin_token = set_api_interactive_approval(True)
                     try:
-                        with notification_turn(agent, muted=muted, session_id=session_id or ""):
+                        with notification_turn(agent, muted=muted, session_id=session_id or "",
+                                display_kind=notification_display_kind):
                             result = agent.run_conversation(**conversation_kwargs)
                     finally:
                         if optin_token is not None:

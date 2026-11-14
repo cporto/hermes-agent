@@ -909,6 +909,8 @@ class OpenAICompatRoutesMixin:
         # above still applies; it grants no internal ingress or control authority.
         if provided_session_id and body.get("hermes_notification_category") == "diagnostic":
             run_kwargs["notification_category"] = "diagnostic"
+        if provided_session_id and body.get("hermes_display_kind") == "internal_notification":
+            run_kwargs["notification_display_kind"] = "internal_notification"
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
             # tool_call_ids with an emitted "running": a "completed" without one (internal/
@@ -958,7 +960,7 @@ class OpenAICompatRoutesMixin:
         outcome, err = await self._run_idempotent(
             request, body, _compute_completion, log_label="chat completions",
             fingerprint_keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream",
-                              "hermes_notification_category"],
+                              "hermes_notification_category", "hermes_display_kind"],
             route="chat_completions",
         )
         if err is not None:
