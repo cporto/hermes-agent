@@ -10,6 +10,7 @@ import hashlib
 import logging
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -1109,11 +1110,38 @@ class SessionSchemaMixin:
         # v32: nothing to run here. The declared tables/columns #106742 added under v31 were already
         # created by _init_schema's executescript(SCHEMA_SQL) + _reconcile_columns() before this chain;
         # the version only records that the store has them (#140315).
+        if current_version < 33:
+            self._migrate_v33_checkmark_titles_to_complete_flag(cursor)
         # Advance schema_version — deliberately NOT gated on the FTS opt-in (that would block
         # every future migration for a user who never optimizes). FTS5 unavailable is the
         # one skip: claiming current would lie.
         if current_version < SCHEMA_VERSION and fts_migrations_complete and fts5_available:
             cursor.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+
+    def _migrate_v33_checkmark_titles_to_complete_flag(self, cursor: sqlite3.Cursor) -> None:
+        """v33: convert legacy "✓ "-prefixed session titles to the new `complete` flag.
+
+        The Mercury client used to mark a session complete by renaming it to a ``✓ ``-prefixed
+        title. That broke the unique-title constraint whenever a second session shared the base
+        title (reproduced: '✓ Check system availability #2' collided with the live one). Move the
+        marker out of the title into the `complete` column: set complete=1, strip the prefix, and
+        if the stripped title would collide, disambiguate THIS row via next_title_in_lineage so the
+        older/live row keeps the base title. The unique title index is already live on existing DBs,
+        so we must never write a colliding title even transiently. Uses direct UPDATE (a
+        set_session_title would raise ValueError on a genuine collision). Idempotent: the
+        '\u2713 %' predicate self-clears and the version gate runs it once."""
+        rows = cursor.execute(
+            "SELECT id, title FROM sessions WHERE title LIKE '\u2713 %' ORDER BY id").fetchall()
+        keep = set(r[0] for r in cursor.execute("SELECT title FROM sessions WHERE title IS NOT NULL"))
+        for row_id, title in rows:
+            # Mirror the client regex ^\s*✓\s* (Sidebar completed()/toggleComplete): the title is
+            # "complete" when its trimmed start is "✓ ". Strip leading whitespace + the marker.
+            base = re.sub(r'^\s*\u2713\s*', '', title, count=1).strip()
+            cursor.execute("UPDATE sessions SET complete = 1 WHERE id = ?", (row_id,))
+            if base in keep:
+                base = next_title_in_lineage(cursor.connection, base)
+            cursor.execute("UPDATE sessions SET title = ? WHERE id = ?", (base, row_id))
+            keep.add(base)
 
     def _advance_message_uid_backfill(self, cursor: sqlite3.Cursor) -> None:
         """Mint ``message_uid`` onto rows written before the column existed, one bounded slice per open.

@@ -277,6 +277,7 @@ class SessionRename(BaseModel):
     pinned: Optional[StrictBool] = None  # durable "keep" (Desktop pins); exempt from auto_archive
     # Read-state watermark (sessions.last_read_at): True = unread, False = read now, None = leave.
     unread: Optional[StrictBool] = None
+    complete: Optional[StrictBool] = None  # user marked the session done (✓ marker)
     profile: Optional[str] = None  # session owned by another profile (opens its state.db)
 
 class SessionOwnerBackfill(BaseModel):

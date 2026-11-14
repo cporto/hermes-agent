@@ -3760,11 +3760,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "message_count", "tool_call_count", "input_tokens", "output_tokens",
             "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
             "actual_cost_usd", "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id", "pinned", "archived", "hidden")
+            "_lineage_root_id", "pinned", "archived", "hidden", "complete")
         payload = {key: session.get(key) for key in safe_keys if key in session}
         # SQLite stores the flags as 0/1.
         payload.update(
-            {f: bool(payload[f]) for f in ("pinned", "archived", "hidden") if f in payload})
+            {f: bool(payload[f]) for f in ("pinned", "archived", "hidden", "complete") if f in payload})
         # Full system prompts / model_config never cross the client API; only their presence.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
@@ -4063,11 +4063,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if err:
             return err
         # pinned/archived/unread are durable desktop-sidebar flags.
-        unknown = sorted(set(body) - {"title", "end_reason", "pinned", "archived", "hidden", "unread"})
+        unknown = sorted(set(body) - {"title", "end_reason", "pinned", "archived", "hidden", "unread", "complete"})
         if unknown:
             return _error_response(
                 f"Unsupported session fields: {', '.join(unknown)}", 400, code="unsupported_session_field")
-        for flag in ("pinned", "archived", "hidden", "unread"):
+        for flag in ("pinned", "archived", "hidden", "unread", "complete"):
             if flag in body and not isinstance(body[flag], bool):
                 return _error_response(f"'{flag}' must be a boolean", 400, code="invalid_session_field")
         db = await self._ensure_session_db_async()
@@ -4082,7 +4082,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Pinned last: set_session_pinned clears hidden, so a pin in the same request
         # wins over an explicit hidden (same order as the dashboard's _RENAME_FLAG_SETTERS).
         for flag, setter in (("archived", db.set_session_archived), ("hidden", db.set_session_hidden),
-                             ("pinned", db.set_session_pinned)):
+                             ("pinned", db.set_session_pinned), ("complete", db.set_session_complete)):
             if flag in body:
                 await asyncio.to_thread(setter, session_id, body[flag])
         if "unread" in body:

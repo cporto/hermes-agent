@@ -927,7 +927,7 @@ async def backfill_session_owner_profiles(body: SessionOwnerBackfill, request: R
 async def rename_session_endpoint(session_id: str, body: SessionRename, request: Request):
     """Title and sidebar flags share one authoritative revision and receipt."""
     from hermes_cli.web_server_sessions import _mutate_session_request
-    payload = {key: getattr(body, key) for key in ('title', 'archived', 'hidden', 'pinned', 'unread')
+    payload = {key: getattr(body, key) for key in ('title', 'archived', 'hidden', 'pinned', 'unread', 'complete')
                if getattr(body, key) is not None}
     return await _mutate_session_request(request, body.profile, session_id,
         request_id=body.request_id, expected_revision=body.expected_revision,

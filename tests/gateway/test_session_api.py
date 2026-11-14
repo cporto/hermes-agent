@@ -1435,3 +1435,120 @@ async def test_interim_commentary_reaches_session_sse_and_responses_stream(adapt
     monkeypatch.setattr("run_agent.AIAgent", CapturingAgent)
     adapter._create_agent(session_id="gated", interim_assistant_callback=lambda *_a, **_k: None)
     assert captured["interim_assistant_callback"] is None
+
+
+@pytest.mark.asyncio
+async def test_patch_session_complete_flag_round_trips(adapter, session_db):
+    """A PATCH {complete} marks the session complete, persists durably, and is projected
+    back to the client as a boolean — mirroring the pinned/archived flag behavior."""
+    session_id = session_db.create_session("complete-session", "api_server")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.patch(f"/api/sessions/{session_id}", json={"complete": True})
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["session"]["complete"] is True
+
+        # Durable, not just echoed.
+        assert bool(session_db.get_session(session_id)["complete"]) is True
+
+        resp = await cli.get(f"/api/sessions/{session_id}")
+        assert (await resp.json())["session"]["complete"] is True
+
+        resp = await cli.patch(f"/api/sessions/{session_id}", json={"complete": False})
+        assert (await resp.json())["session"]["complete"] is False
+        assert bool(session_db.get_session(session_id)["complete"]) is False
+
+
+@pytest.mark.asyncio
+async def test_patch_complete_never_touches_title(adapter, session_db):
+    """Regression: completing a session must PATCH the complete flag and must NOT rename the
+    title (title is unique-constrained). Setting {complete:true} must leave title unchanged."""
+    session_id = session_db.create_session("keep-title", "api_server")
+    session_db.set_session_title(session_id, "My Session")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.patch(f"/api/sessions/{session_id}", json={"complete": True})
+        assert resp.status == 200, await resp.text()
+        got = (await resp.json())["session"]
+        assert got["complete"] is True
+        assert got["title"] == "My Session", "complete PATCH must not rename the title"
+
+
+def test_two_same_base_title_sessions_complete_without_collision(adapter, session_db, tmp_path):
+    """The exact repro: two sessions share base title 'Foo'; completing BOTH via the complete
+    flag (not a '✓ ' title prefix) must not collide on the unique title constraint. Also prove a
+    legacy '✓ Foo' archived row + live 'Foo' migrate without IntegrityError."""
+    import sqlite3
+
+    a = session_db.create_session("dup-a", "api_server")
+    b = session_db.create_session("dup-b", "api_server")
+    session_db.set_session_title(a, "Foo")
+    session_db.set_session_title(b, "Foo #2")
+
+    # Both complete flags flip fine (unique-index untouched by complete).
+    assert session_db.set_session_complete(a, True) is True
+    assert session_db.set_session_complete(b, True) is True
+    assert session_db.get_session(a)["complete"] == 1
+    assert session_db.get_session(b)["complete"] == 1
+
+    # Unique title index still enforced.
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_t ON sessions(title) WHERE title IS NOT NULL")
+        try:
+            conn.execute("INSERT INTO sessions (id, title) VALUES ('dup-c', 'Foo')")
+            raise AssertionError("title 'Foo' should be unique")
+        except sqlite3.IntegrityError:
+            pass  # expected
+    finally:
+        conn.close()
+
+
+def test_v33_migration_rows_and_disambiguates(adapter, session_db, tmp_path):
+    """v33 data migration: a legacy '✓ ' title becomes complete=1 with the prefix stripped; on a
+    collision the migrated row is disambiguated via next_title_in_lineage and the live row keeps
+    the base title; idempotent on a second run; the unique title index survives."""
+    import sqlite3 as _sq
+
+    live = session_db.create_session("live-row", "api_server")
+    archived = session_db.create_session("archived-check", "api_server")
+    session_db.set_session_title(live, "Check system availability #2")
+    # Simulate the legacy client state: an archived row whose title carries the '✓ ' prefix.
+    conn = _sq.connect(str(tmp_path / "state.db"))
+    try:
+        conn.execute("UPDATE sessions SET title='✓ Check system availability #2', archived=1, complete=0 WHERE id=?",
+                     (archived,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    db = session_db
+    # Run the migration once via a raw cursor on the store's db file.
+    conn = _sq.connect(str(tmp_path / "state.db"))
+    try:
+        cursor = conn.cursor()
+        db._migrate_v33_checkmark_titles_to_complete_flag(cursor)
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Archived row: complete=1, prefix stripped, disambiguated to #3; live row untouched.
+    a = session_db.get_session(archived)
+    l = session_db.get_session(live)
+    assert a["complete"] == 1, a
+    assert a["title"] == "Check system availability #3", a["title"]
+    assert l["title"] == "Check system availability #2", l["title"]
+    assert l["complete"] == 0, l
+
+    # Idempotent: second run is a no-op.
+    conn = _sq.connect(str(tmp_path / "state.db"))
+    try:
+        cursor = conn.cursor()
+        db._migrate_v33_checkmark_titles_to_complete_flag(cursor)
+        conn.commit()
+    finally:
+        conn.close()
+    assert session_db.get_session(archived)["title"] == "Check system availability #3"
+    assert session_db.get_session(live)["title"] == "Check system availability #2"

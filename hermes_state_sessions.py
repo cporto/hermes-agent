@@ -1094,6 +1094,12 @@ class SessionSessionsMixin:
         """Hide/unhide a session and its compression lineage from the default listing; still resumable."""
         return self._set_lineage_column("hidden", session_id, int(hidden))
 
+    def set_session_complete(self, session_id: str, complete: bool) -> bool:
+        """Mark/unmark a session complete across its compression lineage (rendered as a ✓ marker).
+        A completion flag is lineage state exactly like archived/pinned/hidden: the root must not
+        resurrect the old state on refresh, so it rides the shared lineage column setter."""
+        return self._set_lineage_column("complete", session_id, int(complete))
+
     def set_session_read(self, session_id: str, read: bool = True) -> bool:
         """Mark read/unread across the compression lineage. ``last_read_at`` is a watermark: unread when
         activity postdates it (no write on the message path). NULL = never tracked = read; 0 = unread."""

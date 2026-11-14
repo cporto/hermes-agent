@@ -2,7 +2,7 @@
 import time
 from hermes_state_runtime import RuntimeStoreError
 
-METADATA_FIELDS = {'title': str, 'archived': bool, 'hidden': bool, 'pinned': bool, 'unread': bool}
+METADATA_FIELDS = {'title': str, 'archived': bool, 'hidden': bool, 'pinned': bool, 'unread': bool, 'complete': bool}
 
 
 def validate_action(operation, payload):
