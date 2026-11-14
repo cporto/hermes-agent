@@ -579,6 +579,13 @@ def _mark_run_progress(self, run_id: str) -> None:
     only reliable way to tell the two apart once the run is no longer subscribed.
     """
     self._run_last_progress_at[run_id] = time.time()
+    # Also refresh widget-visible recency so the polled /v1/widgets "working" pill
+    # stays live across a marathon turn with no status transition. Without this the
+    # recency guard (api_server.py:3549, _WIDGET_LIVE_TTL=120) ages the run out after
+    # 2 min of a live turn and the pill reverts to idle — a live turn reads frozen.
+    cur = self._run_statuses.get(run_id)
+    if cur is not None and cur.get("status") != "completed":
+        cur["updated_at"] = time.time()
 
 
 def _drop_run_transport(self, run_id: str) -> None:

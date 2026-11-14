@@ -4759,6 +4759,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     else event_type
                 )
                 events.enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+            elif event_type in {"subagent.start", "subagent.complete", "subagent.progress"}:
+                # Delegation activity coalesced onto the existing tool.progress wire (Mercury
+                # already normalizes it) so a turn blocked on subagents shows "working" instead
+                # of silence. Mirrors the approval/clarify bridge; goes through events.enqueue
+                # so flush() keeps it ordered before the terminal done/None sentinel.
+                events.enqueue("tool.progress", {"message_id": message_id,
+                                                 "tool_name": "_delegation",
+                                                 "delta": f"{preview or event_type}"})
 
         def _commentary(text: str, *, already_streamed: bool = False) -> None:
             # Mid-turn assistant commentary (Codex ``phase="commentary"``, text beside tool calls)

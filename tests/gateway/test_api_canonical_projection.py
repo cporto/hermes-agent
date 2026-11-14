@@ -453,3 +453,56 @@ async def test_api_turn_selects_the_requests_registered_browser_controller(api, 
     finally:
         broker.reset()
     assert selected == [True]
+
+@pytest.mark.asyncio
+async def test_status_widget_stays_working_across_long_turn(api):
+    """FIX-A regression: a live run whose ``updated_at`` is older than _WIDGET_LIVE_TTL but
+    whose ``_mark_run_progress`` was recently called must still report phase 'working' — a
+    marathon turn with no status transition must not read as frozen after 2 minutes.
+    """
+    import time
+    run_id = f"run_widget_{int(time.time())}"
+    api._run_statuses[run_id] = {
+        "object": "hermes.run", "run_id": run_id, "status": "running",
+        "updated_at": time.time() - 400.0,  # way past _WIDGET_LIVE_TTL=120
+    }
+    api._run_last_progress_at[run_id] = time.time()  # the run is live right now
+
+    # The fix under test: _mark_run_progress also refreshes widget-visible updated_at, so a
+    # run that is old on paper but actively progressing stays "working".
+    from gateway.platforms import api_server_runs as _runs_api
+    # Match the real call site (api_server.py:4732): the progress bump is the module-level
+    # _mark_run_progress invoked with the adapter as self.
+    _runs_api._mark_run_progress(api, run_id)
+
+    widgets = api._build_aggregate_widgets()
+    status_widget = next((w for w in widgets if w.get("kind") == "status"), None)
+    assert status_widget is not None, [w.get("kind") for w in widgets]
+    assert status_widget["state"]["phase"] == "working", status_widget["state"]
+
+    # Cleanup so we don't leak a fake run into other tests' aggregate.
+    api._run_statuses.pop(run_id, None)
+    api._run_last_progress_at.pop(run_id, None)
+
+
+@pytest.mark.asyncio
+async def test_delegation_subagent_frame_reaches_session_stream(api, owner):
+    """FIX-B regression: a delegation ``subagent.start`` event fired through the api-only
+    observer seam must be coalesced onto the session stream as a ``tool.progress`` frame with
+    tool_name '_delegation' — so a turn blocked on subagents shows 'working' instead of silence.
+    """
+    from gateway.session_api_turn import publish_api_tool_progress
+
+    def produce(turn):
+        authority, session_id, generation = turn._approval_owner
+        publish_api_tool_progress(authority, session_id, generation, 'subagent.start',
+                                  'deleg_task_1', None, None)
+
+    frames = await _session_stream_tool_frames(api, owner, produce)
+
+    delegation_frames = [
+        (name, data) for name, data in frames
+        if name == 'tool.progress' and data.get('tool_name') == '_delegation'
+    ]
+    assert delegation_frames, f"expected a coalesced _delegation tool.progress frame, got {frames}"
+    assert delegation_frames[0][1]['delta'] is not None
