@@ -5636,6 +5636,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 bind_declared_conversation=bind_declared_conversation, request_id=request_id, run_owner_scope=run_owner_scope,
                 history_from_session=history_from_session, session_history_delivery=session_history_delivery,
                 turn_author=turn_author, resume_unanswered_turn=resume_unanswered_turn, relay_metadata=relay_metadata,
+                notification_display_kind=notification_display_kind,
                 approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key,
                 clarify_notify_callback=clarify_notify_callback)
         loop = asyncio.get_running_loop()

@@ -120,6 +120,11 @@ def display_kind_for_event(event: Any) -> str | None:
         # A canonical admission committed hidden (Desktop widget intent): never a user bubble.
         return kind
     if getattr(event, "_api_server_chat_turn", False):
+        # A gateway self-post (internal=True) that named the internal-notification kind survives as a
+        # notice; a real client chat turn (no such trusted marker) is a normal user bubble -> NULL.
+        md = getattr(event, "metadata", None) or {}
+        if getattr(event, "internal", False) and md.get("display_kind") == INTERNAL_NOTIFICATION_DISPLAY_KIND:
+            return INTERNAL_NOTIFICATION_DISPLAY_KIND
         # internal=True here is the trust marker, not machinery display: persist NULL (normal user bubble).
         return None
     if getattr(event, "internal", False) and _producer_card(event):

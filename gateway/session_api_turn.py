@@ -236,6 +236,13 @@ def admit_api_steps(adapter, **kwargs):
         # The request's Relay metadata rides the admission to the turn it describes (main passed it
         # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.
         payload['api_turn_v1']['relay_metadata'] = kwargs['relay_metadata']
+
+    _display_kind = kwargs.get('notification_display_kind')
+    if _display_kind == 'internal_notification':
+        # The gateway's own wake self-post (background completion / terminal watch) persists its
+        # user row as a machinery notice, not a user bubble. Trusted: only the private-bound
+        # gateway self-post may send hermes_display_kind; ordinary clients cannot author it.
+        payload['api_turn_v1']['display_kind'] = _display_kind
     request_id = kwargs.get('request_id') or kwargs.get('active_run_id') or uuid.uuid4().hex
     if not isinstance(kwargs['user_message'], list):
         return (yield from _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs))

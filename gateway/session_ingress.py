@@ -292,6 +292,11 @@ async def execute_admission(authority, ref, row):
                 event.allow_gateway_control = False
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
                 event._api_server_chat_turn = True  # real admitted api_server chat turn: user bubble, NOT machinery notice
+                if row['payload'].get('api_turn_v1', {}).get('display_kind') == 'internal_notification':
+                    # A gateway wake self-post (private-bound, client cannot author this kind) marks
+                    # its persisted user row as a notice so display_kind_for_event/run_turn_prepare
+                    # keep it out of the user-bubble timeline. Real client turns carry no such field.
+                    event.metadata['display_kind'] = 'internal_notification'
             response = await authority.runner._handle_message(event)
             result = captured.get('terminal_result', captured.get('result'))
             if result is None:
