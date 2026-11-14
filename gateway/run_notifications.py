@@ -792,7 +792,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         Returns (deliver, info, fail) where ``deliver`` is the zero-arg async callable.
         """
         from gateway.wake import deliver_wake, persist_delegation_delivery
-        from tools.approval import list_gateway_approvals
+        from tools.approval import pending_gateway_approval_count
 
         persist = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)
         info_p = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
@@ -813,9 +813,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return persist, info_p, fail_p
 
         # Gate 3 — confirmation fallback (#85957): a pending human confirmation/approval
-        # (keyed by the same session key) must NOT be crossed by an autonomous wake; persist.
+        # must NOT be crossed by an autonomous wake. The approval queue is keyed by the
+        # PRODUCER's session key (for a Mercury/chat-stream run that is the run_id, NOT the
+        # session id) so a per-session lookup by raw_sid misses run-keyed approvals. Use the
+        # key-agnostic global count: if ANY approval is pending anywhere, do not wake — fail
+        # safe (over-blocking keeps the persist/nudge path; under-blocking could cross a gate).
         try:
-            if list_gateway_approvals(raw_sid):
+            if pending_gateway_approval_count() > 0:
+                logger.info("Async delegation completion for session %s: blocking approval(s) pending — persisting (no wake)", raw_sid)
                 return persist, info_p, fail_p
         except Exception:
             return persist, info_p, fail_p  # fail safe on any uncertainty
