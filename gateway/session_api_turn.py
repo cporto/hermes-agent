@@ -445,9 +445,21 @@ async def _persist_context_usage(adapter, admitted, usage):
         # produced value is already the compressor's last_prompt_tokens (never the cumulative
         # billing sum), where a running += would read false >100% on long sessions.
         used = min(used, window)
-        db.update_session_context_usage(
-            session_id,
-            {'used': used, 'window': window, 'model': model, 'updated_at': time.time()})
+        # Persist the compressor threshold too so the client's 'Compacts at' survives a
+        # reload (the live-runtime path already sends it at api_server.py:5576; storing it
+        # here is what lets the on-load context_usage payload surface it). Best-effort:
+        # absent compressor -> omit the key; the client shows the live value or 'n/a'.
+        threshold = 0
+        try:
+            if _live is not None:
+                _cc = getattr(_live, "context_compressor", None)
+                threshold = int(getattr(_cc, "threshold_tokens", 0) or 0)
+        except Exception:
+            threshold = 0
+        _payload = {'used': used, 'window': window, 'model': model, 'updated_at': time.time()}
+        if threshold > 0:
+            _payload['threshold'] = threshold
+        db.update_session_context_usage(session_id, _payload)
     except Exception:
         logging.getLogger(__name__).debug('context_usage persist skipped', exc_info=True)
 

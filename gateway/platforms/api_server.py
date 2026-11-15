@@ -3854,6 +3854,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         "used": _cu_used,
                         "window": _cu_win,
                         "model": _cu.get("model") or "",
+                        "threshold": _cu.get("threshold") or 0,
                         "updated_at": _cu.get("updated_at"),
                     }
         return payload
