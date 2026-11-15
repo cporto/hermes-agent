@@ -53,6 +53,22 @@ _api_request_browser_control_principal: ContextVar[str] = ContextVar(
     "api_server_browser_control_principal", default="")
 _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
     "api_server_browser_control_transport_family", default="")
+# Client surface (Mercury's X-Hermes-Surface header), strictly sanitized in the middleware
+# before storage; read by the api_server admission so the agent's platform hint knows where
+# it is speaking. Defaults "" (unknown) when the header is absent or fails the allow-list.
+_api_request_surface: ContextVar[str] = ContextVar("api_server_request_surface", default="")
+
+# Strict allow-list for the client surface before it reaches the (client-control-adjacent)
+# system prompt: machine role token only — never prose, spaces, or newlines. Mirrors the
+# session_api_turn._valid_surface re-validation (defense-in-depth).
+_SURFACE_ALLOW_RE = re.compile(r"^[a-z0-9|_-]{0,64}$")
+
+
+def _sanitize_surface_header(raw) -> str:
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip().lower()
+    return value if _SURFACE_ALLOW_RE.fullmatch(value) else ""
 
 class _ArtifactScopeFacade:
     """Minimal scope for ``artifact_scope_key``: server-derived principal + session + transport family."""
@@ -1987,9 +2003,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         self._derive_browser_control_principal(resolved_profile))
                     family_token = _api_request_browser_control_transport_family.set(
                         self._browser_control_transport_family(request))
+                    surface_token = _api_request_surface.set(
+                        _sanitize_surface_header(request.headers.get("X-Hermes-Surface", "")))
                     try:
                         return await handler(request)
                     finally:
+                        _api_request_surface.reset(surface_token)
                         _api_request_browser_control_transport_family.reset(family_token)
                         _api_request_browser_control_principal.reset(principal_token)
             finally:

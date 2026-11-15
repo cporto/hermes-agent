@@ -128,16 +128,32 @@ def context_display_source(compressor: Any) -> str:
 
 
 def context_usage_fields(compressor: Any) -> dict[str, Any]:
-    """Current occupancy only; lifetime throughput is never a context fallback."""
+    """Current occupancy only; lifetime throughput is never a context fallback.
+
+    Preserves a KNOWN used value even when the window is unknown (defaults the window to 0 and
+    leaves context_percent out rather than dropping the whole occupancy — the ring can still
+    fill its numerator). Previously a missing maximum discarded a valid used, which is why the
+    persisted context_usage drifted NULL while the live gauge (which has a model-window fallback)
+    still read the same value."""
     used = max(0, getattr(compressor, "last_prompt_tokens", 0) or 0)
     maximum = getattr(compressor, "context_length", 0) or 0
-    if not used or not maximum:
+    if not used:
         return {}
-    used = min(used, maximum)
-    source = context_display_source(compressor)
-    return {"context_used": used, "context_max": maximum,
-            "context_percent": max(0, min(100, round(used / maximum * 100))),
-            "context_source": source, "context_estimated": source != "provider_usage"}
+    if maximum:
+        # One prompt can never exceed the model window (#109760) — clamp when the
+        # window is known, exactly as before.
+        used = min(used, maximum)
+    out = {"context_used": used}
+    if maximum:
+        out["context_max"] = maximum
+        out["context_percent"] = max(0, min(100, round(used / maximum * 100)))
+        out["context_estimated"] = context_display_source(compressor) != "provider_usage"
+    else:
+        # Window unknown: still return the KNOWN used (numerator) with window 0 so the
+        # caller can persist it rather than dropping the whole occupancy to NULL.
+        out["context_max"] = 0
+    out["context_source"] = context_display_source(compressor)
+    return out
 
 
 def get_authoritative_occupancy(agent) -> dict:

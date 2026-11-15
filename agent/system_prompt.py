@@ -453,6 +453,20 @@ def platform_hint(agent: Any) -> str:
     override + desktop TUI clarifier; cron agents also carry their delivery channel's hint."""
     platform_key = (agent.platform or "").lower().strip()
     _effective_hint = _resolve_platform_hint(agent, platform_key, _default_platform_hint(platform_key))
+    if platform_key == "api_server":
+        # The api_server surface is dynamic per request (Mercury's X-Hermes-Surface
+        # header, e.g. "webkit|ios-pwa|standalone|touch"): tell the model WHERE it is
+        # speaking, mirroring how every messaging platform's hint does. The value is
+        # strictly sanitized at the header seam (see gateway/session_context.set_surface),
+        # so embedding it here is not an injection vector.
+        from gateway.session_context import get_session_env
+        _surface = get_session_env("HERMES_SURFACE", "").strip()
+        if _surface:
+            _effective_hint = (
+                f"{_effective_hint}\n\n"
+                f"You are speaking to the user through Hermes' API (Mercury or a compatible client). "
+                f"Current client surface: {_surface}."
+            ).strip()
     if platform_key == "tui" and _effective_hint:
         _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
     if platform_key == "cron":

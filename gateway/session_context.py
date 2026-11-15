@@ -61,11 +61,26 @@ _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", de
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Client surface (Mercury's X-Hermes-Surface): which client/device is talking
+# (engine|device|displayMode|input, e.g. "webkit|ios-pwa|standalone|touch"). Kept OUT
+# of _SESSION_VARS (like the cron vars) so the api_server per-request bind can set it
+# without disturbing the fixed-position session tuple. Read by the system-prompt
+# platform hint so the assistant knows where it is speaking. Value is STRICTLY
+# sanitized at the header seam (client-controlled -> system prompt = injection surface).
+_SURFACE = ContextVar("HERMES_SURFACE", default=_UNSET)
+
+
+def set_surface(value: str) -> object:
+    """Bind the current task's client-surface ContextVar (Hermes native session SSE
+    / api_server reads X-Hermes-Surface and calls this before a turn). Returns the
+    reset token; the caller restores it in a finally."""
+    return _SURFACE.set(value)
+
 # Legacy env-var name -> ContextVar for get_session_env (_SESSION_ASYNC_DELIVERY deliberately
 # absent: it is a bool capability, read via async_delivery_supported).
 _VAR_MAP = {var.name: var for var in (
     *_SESSION_VARS, _CRON_AUTO_DELIVER_PLATFORM, _CRON_AUTO_DELIVER_CHAT_ID,
-    _CRON_AUTO_DELIVER_THREAD_ID,
+    _CRON_AUTO_DELIVER_THREAD_ID, _SURFACE,
 )}
 
 
@@ -137,7 +152,7 @@ def set_session_vars(
     message_id: str = "", profile: str = "", browser_control_principal: str = "",
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
-    session_history_delivery: str | None = None,
+    session_history_delivery: str | None = None, surface: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -147,7 +162,11 @@ def set_session_vars(
     ``"1"`` (audited producers — explicit session-id header, native API sessions, /v1/runs) or
     ``""`` / omitted (default-deny, #98619).  ``None`` leaves the var at ``_UNSET`` ("never
     declared"), which ``session_history_delivery_supported()`` treats as NOT capable — an omitted declaration
-    cannot grant wake authority."""
+    cannot grant wake authority.
+
+    ``surface`` binds the api_server client surface (Mercury's X-Hermes-Surface, strictly
+    sanitized at the header seam) so the platform-hint tells the agent where it is speaking.
+    Keyword-defaulted so non-API callers (messaging/TUI/Kanban/cron) stay byte-identical."""
     global _session_context_engaged
     _session_context_engaged = True
     values = (
@@ -158,6 +177,10 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    if surface:
+        # Client surface rides the same per-turn context as the rest of the session vars
+        # (cleared by clear_session_vars alongside them). Sanitized upstream, never raw.
+        _SURFACE.set(surface)
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -170,6 +193,7 @@ def clear_session_vars(tokens: list) -> None:
     declared nothing, and an undeclared capability FAILS CLOSED (#98619)."""
     for var in _SESSION_VARS:
         var.set("")
+    _SURFACE.set("")  # keep set/clear symmetric: a surface bound for one turn never leaks
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")

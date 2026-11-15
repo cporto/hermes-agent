@@ -55,14 +55,15 @@ def check_api_turn(authority, ref, payload):
     if 'api_turn_v1' in payload:
         data = payload['api_turn_v1']
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered', 'approval_session_key', 'display_kind'}
+                         'relay_metadata', 'resume_unanswered', 'approval_session_key', 'display_kind', 'surface'}
                 or data.get('resume_unanswered', True) is not True
                 or ('approval_session_key' in data and not isinstance(data['approval_session_key'], str))
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
                 or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))
-                or ('browser_control' in data and not _valid_browser_control(data['browser_control']))):
+                or ('browser_control' in data and not _valid_browser_control(data['browser_control']))
+                or ('surface' in data and not _valid_surface(data['surface']))):
             raise RuntimeStoreError('invalid_params')
         if set(data['settings']) - set(_SETTING_KEYS):
             raise RuntimeStoreError('invalid_params')
@@ -89,6 +90,24 @@ def _request_browser_control():
     bound = {'principal': _api_request_browser_control_principal.get(),
              'transport_family': _api_request_browser_control_transport_family.get()}
     return bound if _valid_browser_control(bound) else None
+
+
+_SURFACE_RE = __import__('re').compile(r'^[a-z0-9|_-]{0,64}$')
+
+
+def _valid_surface(value):
+    """A surface string must be a strict allow-list token (never prose / spaces / newlines):
+    it lands in the client-controlled region of the system prompt, so anything else is
+    rejected outright. Redundant with the header-seam sanitize (defense-in-depth)."""
+    return isinstance(value, str) and _SURFACE_RE.fullmatch(value) is not None
+
+
+def _request_surface():
+    """The authenticated request's client surface (Mercury's X-Hermes-Surface header),
+    as the middleware derived + sanitized it; never client JSON."""
+    from gateway.platforms.api_server import _api_request_surface
+    value = _api_request_surface.get()
+    return value if _valid_surface(value) else None
 
 
 def _rebind_browser_control(adapter, data):
@@ -118,7 +137,8 @@ def api_session_vars():
     bound = current.get('browser_control') or {}
     return {'session_history_delivery': current['settings'].get('session_history_delivery') or '',
             'browser_control_principal': bound.get('principal', ''),
-            'browser_control_transport_family': bound.get('transport_family', '')}
+            'browser_control_transport_family': bound.get('transport_family', ''),
+            'surface': current.get('surface') or ''}
 
 
 def check_api_settings(adapter, settings):
@@ -217,6 +237,12 @@ def admit_api_steps(adapter, **kwargs):
         # Server-derived like the owner scope: the admission keeps the identity the legacy
         # path bound for its executor, so execution and recovery can rebind it.
         payload['api_turn_v1']['browser_control'] = browser_control
+    surface = _request_surface()
+    if surface is not None:
+        # Client surface (Mercury's X-Hermes-Surface), sanitized at the header seam and
+        # re-validated here (defense-in-depth). Carried in the admission like browser_control
+        # so the executing/recovered turn can bind it into the session context.
+        payload['api_turn_v1']['surface'] = surface
     # Refuse a foreign-surface target before committing any media for it (a refused
     # admission otherwise retains its image bytes under native-inputs/ forever).
     existing = authority.db.get_session(sid)
@@ -379,6 +405,27 @@ async def _persist_context_usage(adapter, admitted, usage):
         if not session_id or not isinstance(usage, dict):
             return
         used = usage.get('context_used')
+        if not used:
+            # The caller's usage dict can omit context_used (the producer returns {} when it
+            # has no recorded occupancy). Re-derive from the LIVE authoritative agent so the
+            # ring still persists last-known occupancy instead of staying NULL — the live
+            # gauge already does this via get_authoritative_occupancy (context_breakdown.py),
+            # which is why the ring pops to life during a turn and reverts on reload.
+            try:
+                _auth, _ref, _r = admitted
+                _live = _auth.agent(_ref) if (_auth is not None and _ref is not None) else None
+                if _live is not None:
+                    from agent.context_breakdown import get_authoritative_occupancy
+                    _fields = get_authoritative_occupancy(_live)
+                    _used = _fields.get('context_used')
+                    if _used:
+                        usage = dict(usage)  # don't mutate the caller's dict
+                        usage['context_used'] = _used
+                        usage['context_window'] = _fields.get('context_max')
+                        usage['context_source'] = _fields.get('context_source') or 'provider_usage'
+                        used = _used
+            except Exception:
+                used = None  # re-derive is best-effort; never break the turn
         if not used:
             return
         used = max(0, int(used))
@@ -592,6 +639,7 @@ def prepare_api_execution(authority, ref, payload):
             'resume_unanswered': bool(data and data.get('resume_unanswered')),
             'browser_control': _rebind_browser_control(adapter, data),
             'approval_session_key': data.get('approval_session_key') if data else None,
+            'surface': (data.get('surface') if data and _valid_surface(data.get('surface')) else None),
 }
 
 
