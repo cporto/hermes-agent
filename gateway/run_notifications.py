@@ -807,6 +807,26 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         if not auto_wake:
             return persist, info_p, fail_p
 
+        # Gate 1b — idempotence: a delivery row for this delegation already on the session's
+        # transcript means the completion was already surfaced (a prior wake self-post or the persist
+        # path). Re-waking appends another NON-idempotent internal_notification row, so return a no-op
+        # wake that acknowledges the durable claim without writing anything — the real delivery is
+        # already visible. Fail open to the normal wake path on any lookup error.
+        delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
+        if delegation_id and raw_sid:
+            try:
+                ensure = getattr(adapter, "_ensure_session_db", None)
+                db = await asyncio.to_thread(ensure) if callable(ensure) else None
+                if db is not None and await asyncio.to_thread(
+                        db.delegation_delivery_exists, raw_sid, delegation_id):
+                    async def _skip_duplicate_wake() -> None:
+                        logger.info(
+                            "Async delegation completion %s already delivered on session %s; skipping duplicate wake",
+                            delegation_id, raw_sid)
+                    return _skip_duplicate_wake, info_p, fail_p
+            except Exception:
+                logger.debug("delegation delivery dedup check failed for %s", delegation_id, exc_info=True)
+
         # Gate 2 — idle: never wake a session that holds an active turn (lease).
         # last-writer-wins makes this load-bearing — an intrusive wake corrupts a live turn.
         if raw_sid in (getattr(adapter, "_active_sessions", None) or {}):

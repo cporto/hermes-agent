@@ -30,6 +30,19 @@ class SessionDetachedResultsMixin:
         return self._append_detached_result(session_id, content, kind, metadata, _DELEGATION_DELIVERY_MATCH,
                                             (delegation_id, metadata.get("delivery_notice", "")))
 
+    def delegation_delivery_exists(self, session_id: str, delegation_id: str) -> bool:
+        """Whether a delivery row for this delegation is already on this session's transcript (or its
+        compression lineage). The async-delegation wake self-post writes a non-idempotent
+        ``internal_notification`` row per call, so the wake branch checks this before re-delivering a
+        completion a prior wake (or the persist path) already surfaced. Mirrors
+        ``append_delegation_delivery``'s dedup match but read-only."""
+        if not delegation_id:
+            return False
+        return self._read_one(
+            _LINEAGE_MATCH_SQL + _DELEGATION_DELIVERY_MATCH + " LIMIT 1",
+            (session_id, delegation_id, ""),
+        ) is not None
+
     def append_completion_note(self, session_id: str, admission_id: str, content: str, display_kind: str,
                                metadata: dict[str, Any]) -> int:
         """Record an unviewed completion's note once, keyed by its admission (stored as ``completion_admission``)."""
