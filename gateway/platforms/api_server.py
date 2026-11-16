@@ -5731,6 +5731,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     )
                     if relay_metadata:
                         conversation_kwargs["relay_metadata"] = relay_metadata
+                    # S3 Continue=Resume: a "continue" after an interrupted tool round rehydrates the
+                    # persisted checkpoint as a scripted prelude, so the SAME pending tool call(s) are
+                    # RE-RUN (not re-asked) before the model continues — the LangGraph-checkpointer /
+                    # CopilotKit useInterrupt model, reproduced here. Best-effort and fail-safe: no
+                    # checkpoint (or a non-continue message) degrades to a plain follow-up turn.
+                    _s3_resumed = False
+                    if isinstance(user_message, str):
+                        from agent.stopwords import is_continue_word
+                        if is_continue_word(user_message):
+                            session_key = gateway_session_key or session_id or ""
+                            _root = getattr(self, "gateway_runner", None)
+                            _store = getattr(_root, "session_store", None) if _root is not None else None
+                            _get = getattr(_store, "get_resume_checkpoint", None) if _store is not None else None
+                            if callable(_get):
+                                try:
+                                    _checkpoint = _get(session_key)
+                                except Exception:
+                                    _checkpoint = None
+                                if _checkpoint:
+                                    from agent.resume_prelude import build_resume_prelude
+                                    try:
+                                        _prelude = build_resume_prelude(_checkpoint)
+                                    except Exception:
+                                        _prelude = None
+                                    if _prelude is not None:
+                                        conversation_kwargs["prelude"] = _prelude
+                                        _s3_resumed = True
                     approval_token = None
                     if approval_notify_callback is not None and approval_session_key:
                         # Same machinery as /v1/runs (_run_agent_sync): the contextvar scopes
@@ -5757,6 +5784,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                             _api_runs._unregister_approval_notify(approval_session_key)
                             with suppress(Exception):
                                 reset_current_session_key(approval_token)
+                    # S3: clear the consumed resume checkpoint once the re-run turn has actually run
+                    # (whether it succeeded or the re-run itself was interrupted), so a later "continue"
+                    # with nothing pending degrades to a normal turn (no stale/false "resumed").
+                    if _s3_resumed:
+                        try:
+                            _croot = getattr(self, "gateway_runner", None)
+                            _cstore = getattr(_croot, "session_store", None) if _croot is not None else None
+                            _cclear = getattr(_cstore, "clear_resume_checkpoint", None) if _cstore is not None else None
+                            if callable(_cclear):
+                                _cclear(session_key)
+                        except Exception:
+                            pass  # best-effort: a stale checkpoint self-heals via honest no-pending handling
+                    if isinstance(result, dict) and _s3_resumed:
+                        # Honest state end-to-end: the terminal result advertises that this turn was a
+                        # checkpoint resume (not a fresh turn) so the UI can render it distinctly.
+                        result["resumed_from_checkpoint"] = True
                     result, usage = self._finish_turn_result(
                         agent, result, session_id, route=route, requested_runtime=requested_runtime,
                         route_source=route_source, confirmed_runtime_lock=confirmed_runtime_lock)
