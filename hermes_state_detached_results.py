@@ -31,20 +31,29 @@ class SessionDetachedResultsMixin:
                                             (delegation_id, metadata.get("delivery_notice", "")))
 
     def delegation_delivery_exists(self, session_id: str, delegation_id: str) -> bool:
-        """Whether any delivery of this delegation is already on this session's transcript (or its
-        compression lineage) — so the wake branch can skip a duplicate. The async-delegation wake
-        self-post writes a NON-idempotent ``internal_notification`` row per call, so this must match
-        BOTH the persist path (``async_delegation_complete``/``hidden`` rows keyed by
-        ``display_metadata.delegation_id``) AND the wake path (``internal_notification`` rows, which
-        carry the delegation id only in the content marker ``[ASYNC DELEGATION BATCH COMPLETE —
-        deleg_X]``). Without the wake-row match the gate never fires on the rows the auto-wake path
-        actually writes."""
+        """Whether ANY delivery record for this delegation exists on this session's transcript (or its
+        compression lineage) beyond an interim per-task failure — so the wake branch can skip only a
+        duplicate of the FINAL consolidated result, never a still-pending one.
+
+        The async-delegation wake self-post writes a NON-idempotent ``internal_notification`` row per
+        call, so this must match BOTH the persist path (``async_delegation_complete``/``hidden`` rows
+        keyed by ``display_metadata.delegation_id``) AND the wake path (``internal_notification`` rows,
+        which carry the delegation id only in the content marker ``[ASYNC DELEGATION BATCH COMPLETE —
+        deleg_X]``).
+
+        Interim per-task notices are deliberately excluded: a persist row whose
+        ``display_metadata.delivery_notice`` is ``task_failure:N``, or a wake row whose content carries
+        the ``[ASYNC DELEGATION TASK FAILED — deleg_X]`` marker, is a progress/failure notice — it does
+        NOT mean the final result was delivered, so it must never make this return True and suppress
+        the batch's FINAL consolidated result."""
         if not delegation_id:
             return False
         match = (
             "((m.display_kind IN ('async_delegation_complete', 'hidden') "
-            "AND json_extract(m.display_metadata, '$.delegation_id') = ?) "
-            "OR (m.display_kind = 'internal_notification' AND m.content LIKE ?))"
+            "AND json_extract(m.display_metadata, '$.delegation_id') = ? "
+            "AND coalesce(json_extract(m.display_metadata, '$.delivery_notice'), '') = '') "
+            "OR (m.display_kind = 'internal_notification' "
+            "AND m.content LIKE ? AND m.content NOT LIKE '%ASYNC DELEGATION TASK FAILED%'))"
         )
         return self._read_one(
             _LINEAGE_MATCH_SQL + match + " LIMIT 1",
