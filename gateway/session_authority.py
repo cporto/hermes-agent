@@ -867,9 +867,38 @@ class SessionAuthority:
         from tools.async_delegation import interrupt_for_session
         if agent is not None:
             request_hard_interrupt(agent)
+            # S3 Continue=Resume: persist the interrupt-during-tool-round checkpoint the running
+            # agent stamped (pending tool calls with args) so a later "continue" rehydrates and
+            # RE-RUNS the same tool call instead of a fresh follow-up turn (the LangGraph-
+            # checkpointer analog, keyed by session like thread_id). Best-effort: a failure just
+            # drops the resume and "continue" degrades to a normal turn.
+            _persist_resume_checkpoint_on_interrupt(self, agent, live.route)
         for parent in dict.fromkeys((ref.session_id, self.physical_target(ref))):
             interrupt_for_session(session_key=live.route, parent_session_id=parent, reason='user_stop')
         return self._handle(ref)
+
+
+def _persist_resume_checkpoint_on_interrupt(authority, agent, session_key: str) -> None:
+    """Persist the agent's stamped S3 resume checkpoint (interrupt-during-tool-round) to the
+    durable, session-keyed store. Clear the agent's in-memory stamp so a later (already-started)
+    stop can't double-write. Never raises into the interrupt path."""
+    try:
+        runner = getattr(authority, "runner", None)
+        store = getattr(runner, "session_store", None) if runner is not None else None
+        checkpoint = getattr(agent, "_s3_pending_resume_checkpoint", None)
+        if store is None or not checkpoint:
+            return
+        set_resume = getattr(store, "set_resume_checkpoint", None)
+        if callable(set_resume):
+            set_resume(session_key, checkpoint)
+        # One-shot: consume the in-memory stamp regardless of persistence outcome.
+        try:
+            agent._s3_pending_resume_checkpoint = None
+        except Exception:
+            pass
+    except Exception:
+        # Best-effort resume marker: never break the stop/cancel path.
+        return
 
     def _classic_turn_holds(self, route):
         """The route's running slot is held by a turn this FIFO did not claim (the drain is serial:

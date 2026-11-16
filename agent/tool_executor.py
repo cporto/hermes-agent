@@ -1745,6 +1745,49 @@ def _skip_remaining_sequential(agent, messages: list, remaining, effective_task_
     return _append_skipped_tool_results(agent, messages, remaining, effective_task_id, **skip_kwargs)
 
 
+def _stamp_resume_checkpoint(agent, pending_calls, *, round_start: int) -> None:
+    """S3 Continue=Resume: record an interrupt-during-tool-round on the running agent (in-memory,
+    where the pending tool calls and their args are in scope) so the gateway's interrupt settle can
+    persist a durable, session-keyed checkpoint for a later "continue" to rehydrate (the
+    LangGraph-checkpointer analog). ``pending_calls`` are the tool calls that had NOT yet run when
+    the interrupt landed — the exact calls a resume must RE-RUN, not re-ask. Best-effort and
+    never throws into the turn loop: on any failure the resume simply degrades to a plain follow-up.
+    """
+    try:
+        if not pending_calls:
+            return
+        serialized = [
+            {"name": _tool_call_name(tc), "arguments": _tool_call_arguments(tc)}
+            for tc in pending_calls
+            if _tool_call_name(tc)
+        ]
+        if not serialized:
+            return
+        agent._s3_pending_resume_checkpoint = {
+            "kind": "tool_round",
+            "round_start": round_start,
+            "created_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+            "tool_calls": serialized,
+        }
+    except Exception:
+        # Best-effort resume marker: never break the interrupt/cancellation path.
+        return
+
+
+def _tool_call_name(tc) -> str:
+    fn = getattr(tc, "function", None)
+    if fn is not None:
+        return str(getattr(fn, "name", "") or "")
+    return str(getattr(tc, "name", "") or "")
+
+
+def _tool_call_arguments(tc) -> Any:
+    fn = getattr(tc, "function", None)
+    if fn is not None:
+        return getattr(fn, "arguments", None)
+    return getattr(tc, "arguments", None)
+
+
 def _append_invalid_arguments_result(agent, messages: list, ref: _ToolCallRef, parse_error: str) -> bool:
     """Emit + append the parse-error result for a call whose arguments were not a JSON object."""
     ref.emit_invalid_arguments(agent, parse_error)
@@ -1877,6 +1920,7 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
             return
         # Check interrupt BEFORE each tool so a "stop" during the previous one skips the rest.
         if agent._interrupt_requested:
+            _stamp_resume_checkpoint(agent, tool_calls[i - 1:], round_start=i)
             if not _skip_remaining_sequential(
                 agent, messages, tool_calls[i - 1:], effective_task_id,
                 notice="tool call(s)",
@@ -1910,6 +1954,7 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
             return
 
         if agent._interrupt_requested and i < len(tool_calls):
+            _stamp_resume_checkpoint(agent, tool_calls[i:], round_start=i + 1)
             if not _skip_remaining_sequential(
                 agent, messages, tool_calls[i:], effective_task_id,
                 notice="remaining tool call(s)",
