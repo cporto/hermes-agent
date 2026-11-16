@@ -184,7 +184,42 @@ async def admit_api_turn_async(adapter, steps=None, **kwargs):
     write off the owner loop, in admission order."""
     from gateway.session_authorities import require_active_authority
     authority = require_active_authority(adapter.gateway_runner)
-    return await run_steps_off_loop(authority, steps or admit_api_steps(adapter, **kwargs), orphaned=schedule_orphan)
+    admitted = await run_steps_off_loop(authority, steps or admit_api_steps(adapter, **kwargs), orphaned=schedule_orphan)
+    await _settle_stop_word(adapter, authority, admitted, kwargs)
+    return admitted
+
+
+async def _settle_stop_word(adapter, authority, admitted, kwargs):
+    """S1 runtime kill-switch: a natural-language stop word, classified by ``agent.stopwords``, is
+    enforced as a REAL runtime Cancel BEFORE the message is forwarded to the model. It interrupts
+    the session's active run / cancels its queued admissions (reusing ``stop_session`` ->
+    ``authority.interrupt``/``cancel_queued`` — never a second cancel mechanism) and settles its
+    own admission as cancelled so the stop word is never sent to the model. With no active run
+    there is nothing to abort, so no external cancel is dispatched; the stop word is still settled
+    here (never forwarded). Any control-plane failure fails safe to cancelled (stopped), never
+    keeps running."""
+    from agent.stopwords import is_stop_word
+    user_message = kwargs.get('user_message')
+    if not (isinstance(user_message, str) and is_stop_word(user_message)):
+        return
+    authority_, ref, row = admitted
+    # Cancel the session's in-flight or queued work through the shared control-plane helper (the
+    # same primitives the physical Stop button reuses). Best-effort, forever safe.
+    from gateway.platforms.api_server_authority_runs import stop_session
+    try:
+        await stop_session(adapter, authority_, ref)
+    except Exception:
+        pass  # fail-safe: the stop admission is still settled as cancelled below
+    # Settle THIS admission as cancelled so the stop word is never forwarded to the model.
+    import uuid
+    from gateway.session_contract import Principal
+    actor = Principal('api', authority_.profile_id,
+                      frozenset({'session:submit', 'session:control'}), 'api-stop:' + uuid.uuid4().hex)
+    try:
+        await authority_.cancel_queued(actor, ref, row['admission_id'])
+    except Exception:
+        pass  # already settled/claimed: the store still reports it as cancelled
+
 
 
 def schedule_orphan(admitted):

@@ -3,7 +3,7 @@ from dataclasses import asdict
 
 from gateway.session_contract import Principal, SessionRef
 from gateway.session_results import admission_result
-from hermes_state_runtime import RuntimeStoreError, _row
+from hermes_state_runtime import RuntimeStoreError, _row, list_session_admissions
 
 
 def _authority(adapter):
@@ -134,6 +134,25 @@ async def respond_run(adapter, run_id, body, *, kind):
         return await authority.respond(actor, ref, generation, prompt_id, {field: body[field]}, kind=kind)
     finally:
         await authority.detach(actor, snapshot.subscription_id)
+
+
+async def stop_session(adapter, authority, ref):
+    """S1 natural-language stop: cancel the session's ACTIVE run (``authority.interrupt``) or, when
+    the session is not running, its queued admissions (``authority.cancel_queued``) — the same two
+    primitives the physical Stop button uses (``stop_run``), never a second cancel mechanism.
+    ``ref`` is a live-session ``SessionRef`` on *authority*. Best-effort: a no-op (no run, nothing
+    queued) and never raises into the NL caller, which always settles the stop admission as
+    cancelled (fail safe to "stopped")."""
+    import uuid
+    actor = Principal('api', authority.profile_id,
+                      frozenset({'session:submit', 'session:control'}), 'api-stop:' + uuid.uuid4().hex)
+    handle = authority._handle(ref)
+    if handle.execution_state == 'running':
+        await authority.interrupt(actor, ref, handle.execution_generation)
+        return
+    for row in list_session_admissions(authority.db, session_id=ref.session_id):
+        if row['status'] == 'queued':
+            await authority.cancel_queued(actor, ref, row['admission_id'])
 
 
 async def stop_run(adapter, run_id):
