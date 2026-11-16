@@ -31,16 +31,24 @@ class SessionDetachedResultsMixin:
                                             (delegation_id, metadata.get("delivery_notice", "")))
 
     def delegation_delivery_exists(self, session_id: str, delegation_id: str) -> bool:
-        """Whether a delivery row for this delegation is already on this session's transcript (or its
-        compression lineage). The async-delegation wake self-post writes a non-idempotent
-        ``internal_notification`` row per call, so the wake branch checks this before re-delivering a
-        completion a prior wake (or the persist path) already surfaced. Mirrors
-        ``append_delegation_delivery``'s dedup match but read-only."""
+        """Whether any delivery of this delegation is already on this session's transcript (or its
+        compression lineage) — so the wake branch can skip a duplicate. The async-delegation wake
+        self-post writes a NON-idempotent ``internal_notification`` row per call, so this must match
+        BOTH the persist path (``async_delegation_complete``/``hidden`` rows keyed by
+        ``display_metadata.delegation_id``) AND the wake path (``internal_notification`` rows, which
+        carry the delegation id only in the content marker ``[ASYNC DELEGATION BATCH COMPLETE —
+        deleg_X]``). Without the wake-row match the gate never fires on the rows the auto-wake path
+        actually writes."""
         if not delegation_id:
             return False
+        match = (
+            "((m.display_kind IN ('async_delegation_complete', 'hidden') "
+            "AND json_extract(m.display_metadata, '$.delegation_id') = ?) "
+            "OR (m.display_kind = 'internal_notification' AND m.content LIKE ?))"
+        )
         return self._read_one(
-            _LINEAGE_MATCH_SQL + _DELEGATION_DELIVERY_MATCH + " LIMIT 1",
-            (session_id, delegation_id, ""),
+            _LINEAGE_MATCH_SQL + match + " LIMIT 1",
+            (session_id, delegation_id, f"%{delegation_id}%"),
         ) is not None
 
     def append_completion_note(self, session_id: str, admission_id: str, content: str, display_kind: str,
