@@ -70,9 +70,9 @@ def notification_turn(agent, *, muted: bool, session_id: str = "", display_kind:
         yield
     finally:
         for key, value in saved.items():
-            if value is missing:
-                delattr(agent, key)
-            else:
+            if value is not missing:
                 setattr(agent, key, value)
+            elif getattr(agent, key, missing) is not missing:
+                delattr(agent, key)
         if token is not None:
             _muted_surface.reset(token)
