@@ -480,6 +480,44 @@ def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict
     return cleaned or None
 
 
+# S3 resume-checkpoint field map. Persist only the resumable tool-round record and any
+# out-of-band partial reasoning; never raw chain-of-thought or provider secrets. Pending tool
+# calls are name+arguments; the assistant tool_calls row already durably carries the args, so the
+# checkpoint records enough to re-RUN the same call without re-asking the model.
+_RESUME_CHECKPOINT_KEYS = frozenset({
+    "kind",            # e.g. "tool_round"
+    "tool_calls",      # list of {name, arguments} pending — the calls to RE-RUN on resume
+    "round_start",     # index of the first pending call within the interrupted round (1-based)
+    "partial_reasoning",  # out-of-band partial reasoning (never replayable content)
+    "turn_id",         # the interrupted turn, for identity/one-shot guards
+    "created_at",      # ISO timestamp
+})
+
+
+def sanitize_resume_checkpoint(checkpoint: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Persistable copy of *checkpoint*: only known non-secret keys, well-formed tool_calls, or
+    ``None`` when there is nothing resumable (empty / wrong type / no pending calls)."""
+    if not isinstance(checkpoint, dict):
+        return None
+    cleaned: dict[str, Any] = {k: v for k, v in checkpoint.items() if k in _RESUME_CHECKPOINT_KEYS}
+    calls = checkpoint.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        return None  # no pending tool call => nothing resumable; do not persist a hollow row
+    cleaned_calls = []
+    for tc in calls:
+        if not isinstance(tc, dict):
+            continue
+        name = tc.get("name")
+        args = tc.get("arguments")
+        if isinstance(name, str) and name:
+            cleaned_calls.append({"name": name, "arguments": args})
+    if not cleaned_calls:
+        return None
+    cleaned["tool_calls"] = cleaned_calls
+    cleaned.setdefault("kind", "tool_round")
+    return cleaned or None
+
+
 @dataclass
 class SessionEntry:
     """Routing-index entry: maps a session key to its current session ID and metadata."""
@@ -532,6 +570,13 @@ class SessionEntry:
     # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[dict[str, str]] = None
+    # S3 resume checkpoint: durable, session-keyed record of the interrupted tool round that a
+    # "continue" rehydrates (LangGraph-checkpointer analog). Caps what we persist: exactly what a
+    # resume needs to re-RUN the same tool call(s) without re-asking the model — the pending tool
+    # calls (name+args) and any out-of-band partial reasoning; never raw chain-of-thought in
+    # replayable form. Written at interrupt-during-tool-round; cleared after a resumed turn
+    # rehydrates. None = no resumable checkpoint for this session.
+    resume_checkpoint: Optional[dict[str, Any]] = None
     # Profile owning the bot that received this lane's traffic (``RoutingIdentity.transport_profile``,
     # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
     # what says which bot may deliver to it. None = unknown (row predates the field, or standalone).
@@ -575,6 +620,10 @@ class SessionEntry:
         if self.model_override:
             # Defence-in-depth against an unsanitized dict stored directly.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.resume_checkpoint:
+            # Restart-surviving without replayable CoT: only the resumable tool-round record.
+            checkpoint = sanitize_resume_checkpoint(self.resume_checkpoint)
+            result["resume_checkpoint"] = checkpoint if checkpoint else None
         if self.prompt_pin:
             # Same defence-in-depth: routing JSON must never preserve malformed pin state.
             if pin := sanitize_prompt_pin(self.prompt_pin):
@@ -624,6 +673,7 @@ class SessionEntry:
             last_resume_marked_at=_parse_iso(data.get("last_resume_marked_at")),
             active_turn_token=token, active_turn_started_at=started_at,
             model_override=sanitize_model_override(data.get("model_override")),
+            resume_checkpoint=sanitize_resume_checkpoint(data.get("resume_checkpoint")),
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
             **plain,
@@ -1120,6 +1170,48 @@ class SessionStore(
             data[session_key] = replace(entry, model_override=cleaned).to_dict()
             self._persist_routing_data(data, generation)
             entry.model_override = cleaned
+
+    def set_resume_checkpoint(self, session_key: str, checkpoint: Optional[dict[str, Any]]) -> None:
+        """Persist (or clear, with ``None``) the S3 resume checkpoint for *session_key*.
+
+        The checkpointer analog for Continue=Resume: written at interrupt-during-tool-round so a
+        later "continue" rehydrates the pending tool call instead of a fresh follow-up turn. Only
+        the sanitized, non-secret record is stored (pending tool calls + out-of-band partial
+        reasoning — never raw CoT in replayable form)."""
+        from dataclasses import replace
+
+        cleaned = sanitize_resume_checkpoint(checkpoint)
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or entry.resume_checkpoint == cleaned:
+                return
+            # Publish only after persistence so a failed clear remains retryable.
+            data, generation = self._snapshot_routing_locked()
+            entry = self._entries[session_key]
+            data[session_key] = replace(entry, resume_checkpoint=cleaned).to_dict()
+            self._persist_routing_data(data, generation)
+            entry.resume_checkpoint = cleaned
+
+    def get_resume_checkpoint(self, session_key: str) -> Optional[dict[str, Any]]:
+        """Return the persisted S3 resume checkpoint for *session_key*, if any (None otherwise)."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return dict(entry.resume_checkpoint) if entry and entry.resume_checkpoint else None
+
+    def clear_resume_checkpoint(self, session_key: str) -> bool:
+        """Clear the S3 resume checkpoint for *session_key*. True if a checkpoint was removed."""
+        from dataclasses import replace
+
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or not entry.resume_checkpoint:
+                return False
+            data, generation = self._snapshot_routing_locked()
+            entry = self._entries[session_key]
+            data[session_key] = replace(entry, resume_checkpoint=None).to_dict()
+            self._persist_routing_data(data, generation)
+            entry.resume_checkpoint = None
+            return True
 
     def set_session_yolo(self, session_key: str, enabled: Optional[bool]) -> bool:
         """Persist the lane's ``/yolo`` bypass (None: back to the launch policy); False when the key has no
