@@ -197,6 +197,10 @@ def terminal_run_status(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     fields: dict[str, Any] = {
         "completed": finished, "partial": bool(result.get("partial")), "interrupted": interrupted,
     }
+    if result.get("resumed_from_checkpoint"):
+        # S3 honest state: this turn was a checkpoint resume, not a fresh follow-up turn. The
+        # frontend renders a distinct "resumed from checkpoint" receipt.
+        fields["resumed"] = True
     if not finished and result.get("turn_exit_reason"):
         fields["turn_exit_reason"] = str(result["turn_exit_reason"])
     if result.get("pending_steer"):
