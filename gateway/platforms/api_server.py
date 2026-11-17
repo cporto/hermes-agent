@@ -5784,6 +5784,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                             _api_runs._unregister_approval_notify(approval_session_key)
                             with suppress(Exception):
                                 reset_current_session_key(approval_token)
+                    # S3 Continue=Resume (write side): now that run_conversation has returned, the
+                    # interrupted tool loop has STAMPED the pending tool calls onto the agent — the
+                    # only moment they exist. Persist a durable, session-keyed checkpoint so a later
+                    # "continue" rehydrates and RE-RUNS the same tool call(s) (LangGraph-checkpointer
+                    # analog). Use the SAME session_key the continue path reads (gateway_session_key
+                    # or session_id) and consume the one-shot stamp. Best-effort: any failure just
+                    # drops the resume -> "continue" degrades to a normal turn.
+                    _maybe_s3 = getattr(agent, "_s3_pending_resume_checkpoint", None)
+                    if _maybe_s3 and not _s3_resumed:
+                        from gateway.session_authority import _persist_resume_checkpoint_on_interrupt
+                        _skey3 = gateway_session_key or session_id or ""
+                        _rroot3 = getattr(self, "gateway_runner", None)
+                        _sstore3 = getattr(_rroot3, "session_store", None) if _rroot3 is not None else None
+                        if _sstore3 is not None:
+                            try:
+                                _persist_resume_checkpoint_on_interrupt(_sstore3, agent, _skey3)
+                            except Exception:
+                                pass
                     # S3: clear the consumed resume checkpoint once the re-run turn has actually run
                     # (whether it succeeded or the re-run itself was interrupted), so a later "continue"
                     # with nothing pending degrades to a normal turn (no stale/false "resumed").
