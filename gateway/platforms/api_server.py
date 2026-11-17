@@ -123,6 +123,7 @@ _CAPABILITY_ENDPOINTS = (
     ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")),
     ("files_download", ("GET", "/v1/files")),
     ("files_upload", ("POST", "/v1/files")),
+    ("files_validate", ("POST", "/v1/files/validate")),
 )
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
@@ -178,6 +179,11 @@ from gateway.readiness import collect_runtime_readiness
 from gateway.browser_control_artifacts import (
     ArtifactError, ArtifactRateLimiter, ArtifactStore, ArtifactTooLarge, DEFAULT_ALLOWED_MIME_TYPES,
     DEFAULT_MAX_ARTIFACT_BYTES, DEFAULT_ARTIFACT_TTL_SECONDS)
+# Single source of the file-serving allowlist rules (roots, deny-list, validator); re-exported so
+# the streaming GET /v1/files download and the batch POST /v1/files/validate oracle share one copy.
+from gateway.files_allowlist import (
+    _files_roots, _files_deny_dirs, _FILES_DENY_SEGMENTS, _FILES_DENY_NAMES, _FILES_MAX_BYTES,
+    _validate_allowlist_path)
 from gateway.browser_control_broker import (
     BROWSER_CONTROL_ARTIFACT_CAPABILITIES, BROWSER_CONTROL_CAPABILITIES, BROWSER_CONTROL_DEVELOPER_CAPABILITIES,
     ControllerScope, ControllerTicketInvalid, browser_control_developer_mode,
@@ -986,95 +992,11 @@ def _invalid_request(message: str) -> web.Response:
 # ---------------------------------------------------------------------------
 # GET /v1/files — path-based, allowlist-rooted file download.
 #
-# Allowlist roots are ABSOLUTE paths resolved from the runtime $HOME at startup
-# (never hardcoded /home/... guesses). Every check runs against the canonical
-# (symlink-resolved) path. We reject `..` components, a raw backslash, control
-# bytes, non-absolute input, and URL-encoded traversal tokens (%2e / %2f / %5c)
-# on the RAW query string — we never "decode then hope". Only regular, non-hardlink
-# files under an allowed root and off the deny-list are served, always as
-# `Content-Disposition: attachment` + `X-Content-Type-Options: nosniff` (never
-# inline, so agent/uploaded HTML or SVG can't script). Errors never echo the path.
-_FILES_MAX_BYTES = 50 * 1024 * 1024
-
-
-def _files_roots() -> list[str]:
-    """Absolute allowlist roots, resolved once from the runtime $HOME."""
-    home = os.path.expanduser("~")
-    raw = [
-        os.path.join(home, "Projects"),
-        os.path.join(home, "workspace"),
-        os.path.join(home, ".hermes"),
-        os.path.join(home, ".hermes", "cache", "scratch"),
-        os.path.join(home, "Downloads"),
-        "/tmp",
-    ]
-    return [os.path.realpath(r) for r in raw]
-
-
-def _files_deny_dirs() -> list[str]:
-    """Absolute directories that are never served even though they sit under an allowed root."""
-    home = os.path.expanduser("~")
-    gateway_dir = os.path.realpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return [
-        os.path.realpath(os.path.join(home, ".ssh")),
-        os.path.realpath(os.path.join(home, ".hermes", "keys")),
-        gateway_dir,
-    ]
-
-
-# Any path segment matching one of these (e.g. `.git`) denies the whole path.
-_FILES_DENY_SEGMENTS = (".git",)
-# Leaf-name patterns that are never served even inside an allowed root.
-_FILES_DENY_NAMES = (
-    ".env", ".env.*", "*.pem", "*.key", "id_rsa", "id_ed25519",
-    "known_hosts", "authorized_keys", "API_SERVER_KEY", "state.db",
-    "*.sqlite*", "package-lock.json", "config.yaml", "config.yml",
-)
-
-
-def _validate_allowlist_path(raw_path: str) -> tuple[Optional[str], Optional[str]]:
-    """Return ``(canonical_allowed_path, None)`` if safe to serve, else ``(None, deny_reason)``."""
-    if not raw_path:
-        return None, "missing_path"
-    if "\x00" in raw_path or any(ord(c) < 32 for c in raw_path):
-        return None, "bad_path"
-    if "\\" in raw_path:
-        return None, "backslash"
-    expanded = os.path.expanduser(raw_path)
-    if not os.path.isabs(expanded):
-        return None, "not_absolute"
-    if any(part == ".." for part in expanded.replace("\\", "/").split("/")):
-        return None, "traversal"
-    canonical = os.path.realpath(expanded)
-    for deny_dir in _files_deny_dirs():
-        if canonical == deny_dir or canonical.startswith(deny_dir + os.sep):
-            return None, "denied"
-    allowed = False
-    for root in _files_roots():
-        if canonical == root or canonical.startswith(root + os.sep):
-            allowed = True
-            break
-    if not allowed:
-        return None, "not_allowed"
-    parts = canonical.split(os.sep)
-    if any(seg in _FILES_DENY_SEGMENTS for seg in parts):
-        return None, "denied"
-    leaf = parts[-1] if parts else canonical
-    if any(fnmatch.fnmatch(leaf, pat) for pat in _FILES_DENY_NAMES):
-        return None, "denied"
-    try:
-        st = os.stat(canonical)
-    except FileNotFoundError:
-        return None, "not_found"
-    except OSError:
-        return None, "read_error"
-    if not stat.S_ISREG(st.st_mode):
-        return None, "not_a_file"
-    if st.st_nlink != 1:
-        return None, "hardlink"
-    if st.st_size > _FILES_MAX_BYTES:
-        return None, "too_large"
-    return canonical, None
+# The allowlist roots, deny-list, and the pure path validator now live in
+# :mod:`gateway.files_allowlist` (imported above) as the SINGLE source of truth, shared
+# with the batch POST /v1/files/validate oracle. This handler keeps its own streaming +
+# the opened-fd TOCTOU checks (regular file, st_nlink == 1, size cap, inode identity);
+# the moved primitives are pure validation only. Errors never echo the resolved path.
 
 
 def _files_deny_response(reason: str) -> web.Response:
@@ -1094,6 +1016,20 @@ def _files_deny_response(reason: str) -> web.Response:
         "read_error": 403,
     }.get(reason, 403)
     return _error_response("Requested file is not available.", status, code="files_denied")
+
+
+# Stable deny reason codes surfaced by the batch validate oracle. Anything not listed here
+# (missing_path, backslash, read_error, ...) is collapsed to "denied" so the client only ever
+# sees a known, generic classification. The resolved/canonical path is never returned.
+_VALIDATE_STABLE_REASONS = frozenset({
+    "not_found", "not_absolute", "traversal", "bad_path", "denied",
+    "not_allowed", "not_a_file", "hardlink", "too_large",
+})
+
+
+def _validate_reason_code(reason: str) -> str:
+    """Map a validator deny reason to a stable generic code (all unknown reasons -> "denied")."""
+    return reason if reason in _VALIDATE_STABLE_REASONS else "denied"
 
 
 # ---------------------------------------------------------------------------
@@ -2033,6 +1969,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/files", self._handle_files_download),
             ("POST", "/v1/files", self._handle_files_upload),
+            ("POST", "/v1/files/validate", self._handle_files_validate),
             ("GET", "/v1/widgets", self._handle_widgets),
             ("GET", "/v1/widgets/{widget_id}", self._handle_widget),
             ("GET", "/v1/skills", self._handle_skills),
@@ -3331,6 +3268,53 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         finally:
             os.close(fd)
         return resp
+
+    async def _handle_files_validate(self, request: web.Request) -> web.Response:
+        """POST /v1/files/validate — batch confirmation oracle mirroring GET /v1/files.
+
+        For each raw path string it runs the SAME shared allowlist validator
+        (:mod:`gateway.files_allowlist`) the download stream uses, so "validate says ok" and
+        "download returns 200" can never drift. It stats only (never opens/reads/streams the
+        body) and never echoes the resolved canonical path — only the client's input string and,
+        for OK results, the basename + size. Returns 200 always with ``{"results":[...]}`` in
+        input order, one result per input even on error.
+        """
+        _ctx, err = self._artifact_route_prelude(request, "files", check_enabled=False)
+        if err is not None:
+            return err
+        try:
+            data = await request.read()
+            payload = json.loads(data.decode("utf-8")) if data else None
+        except Exception:
+            payload = None
+        invalid = web.json_response({"error": [{"code": "files_validate_invalid"}]}, status=400)
+        if not isinstance(payload, dict) or not isinstance(payload.get("paths"), list):
+            return invalid
+        paths = payload["paths"]
+        if not paths or len(paths) > 64:
+            return invalid
+        results = []
+        for raw in paths:
+            if not isinstance(raw, str):
+                # Non-string input is not a valid path to serve; never echo a resolved path.
+                results.append({"path": raw, "ok": False, "reason": "denied"})
+                continue
+            canonical, reason = _validate_allowlist_path(raw)
+            if canonical is None:
+                results.append({"path": raw, "ok": False, "reason": _validate_reason_code(reason)})
+                continue
+            try:
+                size = os.stat(canonical).st_size
+            except OSError:
+                results.append({"path": raw, "ok": False, "reason": "denied"})
+                continue
+            results.append({
+                "path": raw,
+                "ok": True,
+                "name": os.path.basename(canonical),
+                "size": size,
+            })
+        return web.json_response({"results": results}, status=200)
 
     @_require_auth
     async def _handle_files_upload(self, request: web.Request) -> web.Response:
