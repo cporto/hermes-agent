@@ -66,6 +66,8 @@ def run_admission(adapter, run_id):
 
 
 def run_projection(adapter, run_id):
+    from gateway.platforms.api_server import _resolve_media_to_data_urls
+
     owned = run_admission(adapter, run_id)
     if owned is None:
         return None
@@ -84,7 +86,6 @@ def run_projection(adapter, run_id):
             # The run SSE's own mapper: a `partial` or `completed: false` turn (iteration
             # budget, truncation) settles with outcome `completed` but is a failed run there,
             # so polling must not report `completed` for the same receipt.
-            from gateway.platforms.api_server import _resolve_media_to_data_urls
             from gateway.platforms.api_server_runs import terminal_run_status
             status = terminal_run_status(result)[0]
     pending = []
