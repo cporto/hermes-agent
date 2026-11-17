@@ -339,6 +339,13 @@ def _append_skipped_tool_results(
     ``hook_error_type`` also emits the terminal ``post_tool_call`` (status=cancelled) per
     call with ``hook_id`` overriding the hook's id; ``flush_stage`` flushes after each
     append and returns False on the first failed flush when ``stop_on_flush_failure``."""
+    # S3 Continue=Resume: this is the shared interrupt funnel across executor paths (sequential
+    # reaches it via _skip_remaining_sequential AFTER stamping; concurrent/segmented call it
+    # directly). If the agent has not yet stamped a resume checkpoint, capture these skipped
+    # (un-executed, pending) calls so a later "continue" re-runs the SAME tools instead of a plain
+    # redo. Best-effort: never throw into the interrupt/cancel path.
+    if not getattr(agent, "_s3_pending_resume_checkpoint", None):
+        _stamp_resume_checkpoint(agent, list(tool_calls), round_start=1)
     for tc in tool_calls:
         name = _tc_name(tc)
         result = content.replace("{name}", name)
