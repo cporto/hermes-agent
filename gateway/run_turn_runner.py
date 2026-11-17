@@ -935,6 +935,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from tools.approval import register_gateway_notify, unregister_gateway_notify
         from tools.approval_context import reset_current_session_key, set_current_session_key
         ctx = self._ctx
+        from agent.resume_prelude import build_resume_prelude
+        from agent.stopwords import is_continue_word
         session_key = ctx.session_key or ""
         # An admitted API turn carries its turn-unique run_id (approval_session_key); the native
         # producer binds it so the approval gate parks under run_id (resolved by the run-scoped
@@ -980,6 +982,21 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            # S3 Continue=Resume — READ side: a bare continue/resume API admission rehydrates the
+            # persisted interrupt checkpoint (the pending tool round) as a scripted prelude, so the
+            # resumed turn re-runs that round instead of a fresh follow-up. Keyed by ctx.session_key
+            # (the route) on both read and write; fail-safe when nothing is checkpointed/non-continue/
+            # prelude None/rejected by this agent.
+            _resumed_s3 = False
+            if api is not None and isinstance(api.get('content'), str) and is_continue_word(api['content']):
+                try:
+                    _cp = self._runner.session_store.get_resume_checkpoint(ctx.session_key)
+                except Exception:
+                    _cp = None
+                _prelude = build_resume_prelude(_cp) if _cp else None
+                if _prelude is not None and _accepts_keyword(agent.run_conversation, "prelude"):
+                    kwargs["prelude"] = _prelude
+                    _resumed_s3 = True
             from agent.notification_presentation import notification_turn
             from gateway.session_results import execution_result
             captured = execution_result.get()
@@ -987,6 +1004,21 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                       getattr(agent, 'session_completion_tokens', 0) or 0)
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 result = agent.run_conversation(api_message, **kwargs)
+            # S3 Continue=Resume — WRITE side: persist the agent's stamped interrupt checkpoint only
+            # for API admissions (api is not None), and never during a resumed turn (a re-generated
+            # pending set would only be re-stamped and never cleared).
+            _maybe_s3 = getattr(agent, "_s3_pending_resume_checkpoint", None)
+            if _maybe_s3 and not _resumed_s3 and api is not None:
+                from gateway.session_authority import _persist_resume_checkpoint_on_interrupt
+                _persist_resume_checkpoint_on_interrupt(self._runner.session_store, agent, ctx.session_key)
+            # A consumed resume clears its checkpoint and honestly reports the resumed turn.
+            if _resumed_s3:
+                try:
+                    self._runner.session_store.clear_resume_checkpoint(ctx.session_key)
+                except Exception:
+                    pass
+                if isinstance(result, dict):
+                    result["resumed_from_checkpoint"] = True
             if captured is not None:
                 incoming = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
                 outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
