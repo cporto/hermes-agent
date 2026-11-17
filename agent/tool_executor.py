@@ -1546,6 +1546,11 @@ def _unfinished_tool_result(agent, ref: _ToolCallRef, *, timed_out: bool, timeou
 def _append_batch_results(agent, messages: list, effective_task_id: str, batch: _ConcurrentBatch, budget: BudgetConfig) -> bool:
     """Append every slot's result in original call order; returns False at the first
     failed flush (the caller must stop the batch)."""
+    # Resume stamp candidates: slots that never started because a stop landed mid-batch
+    # (no result, not timed out). The sequential path already stamps these; the concurrent
+    # path needs the same one-shot continue=resume checkpoint so "continue" re-runs them.
+    pending_interrupt_calls = []
+    pending_interrupt_start = None
     for i, pc in enumerate(batch.parsed_calls):
         r = batch.results[i]
         # A worker may finish between the deadline snapshot and this loop;
@@ -1555,6 +1560,10 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
             function_result, tool_duration, effect_disposition = _unfinished_tool_result(
                 agent, ref, timed_out=i in batch.timed_out_indices, timeout_s=batch.timeout_s,
             )
+            if i not in batch.timed_out_indices and agent._interrupt_requested:
+                if pending_interrupt_start is None:
+                    pending_interrupt_start = i + 1
+                pending_interrupt_calls.append(pc.tool_call)
         else:
             ref, function_result, tool_duration, is_error, blocked = r.ref, r.result, r.duration, r.is_error, r.blocked
             effect_disposition = "none" if blocked else None
@@ -1577,6 +1586,8 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
             _print_tool_completed(agent, i + 1, tool_duration, _multimodal_text_summary(display_function_result))
 
         _emit_tool_complete_and_risk(agent, ref, display_function_result, risk_metadata, blocked)
+    if pending_interrupt_calls and not getattr(agent, "_s3_pending_resume_checkpoint", None):
+        _stamp_resume_checkpoint(agent, pending_interrupt_calls, round_start=pending_interrupt_start)
     return True
 
 
