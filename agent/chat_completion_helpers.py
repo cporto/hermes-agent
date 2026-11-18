@@ -1911,6 +1911,16 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
         "Top up credits, or run `%s` to pick a model this account can use.",
         profile, old_model, old_provider, fb_model, fb_provider, remedy,
     )
+    try:
+        emit = getattr(agent, "_emit_warning", None)
+        if callable(emit):
+            emit(
+                f"⚠ Primary model {old_model} via {old_provider} is out of credits — "
+                f"answering via fallback {fb_model} via {fb_provider}. "
+                f"Top up credits, or run `{remedy}` to restore the primary."
+            )
+    except Exception:
+        pass
 
 
 def _fallback_chain_exhausted(agent, reason: FailoverReason | None) -> bool:
