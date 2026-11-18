@@ -55,7 +55,8 @@ def check_api_turn(authority, ref, payload):
     if 'api_turn_v1' in payload:
         data = payload['api_turn_v1']
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered', 'approval_session_key', 'display_kind', 'surface'}
+                         'relay_metadata', 'resume_unanswered', 'approval_session_key', 'display_kind', 'surface',
+                         'client_message_id'}
                 or data.get('resume_unanswered', True) is not True
                 or ('approval_session_key' in data and not isinstance(data['approval_session_key'], str))
                 or not {'history', 'settings'} <= set(data)
@@ -63,6 +64,7 @@ def check_api_turn(authority, ref, payload):
                 or (data['history'] is not None and not isinstance(data['history'], list))
                 or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))
                 or ('browser_control' in data and not _valid_browser_control(data['browser_control']))
+                or ('client_message_id' in data and not _valid_client_message_id(data['client_message_id']))
                 or ('surface' in data and not _valid_surface(data['surface']))):
             raise RuntimeStoreError('invalid_params')
         if set(data['settings']) - set(_SETTING_KEYS):
@@ -74,6 +76,14 @@ def check_api_turn(authority, ref, payload):
 
 def _valid_owner_scope(value):
     return isinstance(value, str) and _OWNER_SCOPE_RE.fullmatch(value) is not None
+
+
+_CLIENT_MESSAGE_ID_RE = re.compile(r'[A-Za-z0-9_-]{1,64}')
+
+
+def _valid_client_message_id(value):
+    """A safe client idempotency token or None (defense-in-depth; the door also validates)."""
+    return isinstance(value, str) and _CLIENT_MESSAGE_ID_RE.fullmatch(value) is not None
 
 
 def _valid_browser_control(value):
@@ -297,6 +307,11 @@ def admit_api_steps(adapter, **kwargs):
         # The request's Relay metadata rides the admission to the turn it describes (main passed it
         # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.
         payload['api_turn_v1']['relay_metadata'] = kwargs['relay_metadata']
+    _cmid = kwargs.get('client_message_id')
+    if _cmid:
+        # Client idempotency key (validated at the door). Rides the admission to the durable
+        # user row's display_metadata so the client matches its optimistic turn by EXACT id.
+        payload['api_turn_v1']['client_message_id'] = _cmid
 
     _display_kind = kwargs.get('notification_display_kind')
     if _display_kind == 'internal_notification':
@@ -683,6 +698,7 @@ def prepare_api_execution(authority, ref, payload):
     return {'adapter': adapter, 'settings': settings, 'history': data['history'] if data else None,
             'content': content, 'turn_author': data.get('turn_author') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
+            'client_message_id': data.get('client_message_id') if data else None,
             'resume_unanswered': bool(data and data.get('resume_unanswered')),
             'browser_control': _rebind_browser_control(adapter, data),
             'approval_session_key': data.get('approval_session_key') if data else None,

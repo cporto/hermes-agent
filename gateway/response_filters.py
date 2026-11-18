@@ -148,7 +148,10 @@ def display_metadata_for_event(event: Any) -> dict:
     ``title_preview`` (titler-only) a canonical admission committed for this exact event."""
     from gateway.session_display import admission_display
     preview = admission_display(event).get("title_preview")
-    return {**_producer_card(event), **({"title_preview": preview} if preview else {})}
+    _cmid = (getattr(event, "metadata", None) or {}).get("client_message_id")
+    return {**_producer_card(event),
+            **({"title_preview": preview} if preview else {}),
+            **({"client_message_id": _cmid} if _cmid else {})}
 
 
 def is_machinery_display_kind(display_kind: Any) -> bool:

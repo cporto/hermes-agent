@@ -285,6 +285,11 @@ async def execute_admission(authority, ref, row):
                 # Committed media resolves under the owning profile's home, like admission did.
                 prepared = prepare_api_execution(authority, ref, row['payload'])
                 api_execution.set(prepared)
+                if prepared.get('client_message_id'):
+                    # Carry the client idempotency key onto the event so it reaches the persisted
+                    # user row's display_metadata (via display_metadata_for_event) and is echoed
+                    # back for the client's exact-id match.
+                    event.metadata['client_message_id'] = prepared['client_message_id']
                 if isinstance(event.text, list):
                     # The durable transcript keeps the committed media references (the same
                     # ``[Image attached ...]`` hints native transports persist), not only the caption.

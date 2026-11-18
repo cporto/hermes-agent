@@ -459,6 +459,21 @@ def _project_internal_notification_for_display(message: dict) -> dict | None:
     return projected
 
 
+_CLIENT_MESSAGE_ID_RE = re.compile(r'[A-Za-z0-9_-]{1,64}')
+
+
+def _valid_client_message_id(value: Any) -> Optional[str]:
+    """Return a safe client idempotency token or None.
+
+    Mercury mints a UUID per send and sends it as ``client_message_id``; the gateway
+    persists it on the durable user row's ``display_metadata`` and echoes it back so the
+    client matches its optimistic turn by EXACT id. Anything that is not a short
+    ``[A-Za-z0-9_-]`` token is ignored (never persisted, never echoed) so a hostile value
+    can never reach storage or the wire. Absent/invalid -> None -> content-match fallback.
+    """
+    return value if isinstance(value, str) and _CLIENT_MESSAGE_ID_RE.fullmatch(value) else None
+
+
 def _project_client_message(message: dict[str, Any]) -> dict[str, Any]:
     """Strip compaction scaffolding: standalone handoffs become hidden empty rows (stable
     ids), merged handoffs keep only the real prior-tail content; inherited tool calls dropped."""
@@ -3845,12 +3860,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @staticmethod
     def _message_response(message: dict[str, Any]) -> dict[str, Any]:
+        # Read the client idempotency key from the RAW row's persisted display_metadata
+        # (before projection may drop the blob). Surface ONLY this whitelisted scalar —
+        # never the whole display_metadata (gateway_input_owner, notification_*,
+        # delegation_id etc. must not leak to the client).
+        _cmid = (message.get("display_metadata") or {}).get("client_message_id")
         message = _project_client_message(message)
+        if isinstance(_cmid, str) and _cmid:
+            message = {**message, "client_message_id": _cmid}
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
             "timestamp", "token_count", "input_tokens", "output_tokens", "finish_reason",
             "reasoning", "reasoning_content",
-            "display_kind", "attachments")
+            "display_kind", "attachments", "client_message_id")
         return {key: message.get(key) for key in safe_keys if key in message}
 
     async def _read_json_body(self, request: web.Request) -> tuple[dict[str, Any], Optional[web.Response]]:
@@ -4458,6 +4480,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return None, _error_response("system_message must be a string", 400, code="invalid_system_message")
+        # Optional client idempotency key (Mercury mints it per send and echoes it back on
+        # the durable user row so its optimistic turn is matched by EXACT id). Validated to
+        # a safe token; absent or malformed -> None (graceful content-match fallback), never 400.
+        client_message_id = _valid_client_message_id(body.get("client_message_id"))
         runtime_request = self._effective_session_runtime_request(session=session, body=body)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
@@ -4494,6 +4520,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active, turn_author=turn_author,
+            client_message_id=client_message_id,
             # #98619: the client addresses this session by construction — the id is in the
             # request path (/api/sessions/{session_id}/chat) — so a wake self-post lands where
             # the client will read it. The audited native-session opt-in.
@@ -5606,6 +5633,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         request_id: Optional[str] = None, history_from_session: bool = False, run_owner_scope=None,
         session_history_delivery: str = "", turn_author: Optional[dict[str, Any]] = None,
+        client_message_id: Optional[str] = None,
         relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
         notification_display_kind: str = "",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
@@ -5640,6 +5668,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 bind_declared_conversation=bind_declared_conversation, request_id=request_id, run_owner_scope=run_owner_scope,
                 history_from_session=history_from_session, session_history_delivery=session_history_delivery,
                 turn_author=turn_author, resume_unanswered_turn=resume_unanswered_turn, relay_metadata=relay_metadata,
+                client_message_id=client_message_id,
                 notification_display_kind=notification_display_kind,
                 approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key,
                 clarify_notify_callback=clarify_notify_callback)
