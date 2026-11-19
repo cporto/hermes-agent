@@ -496,6 +496,11 @@ def _project_client_message(message: dict[str, Any]) -> dict[str, Any]:
         projected = {k: v for k, v in message.items() if k not in _COMPACTION_INTERNAL_FIELDS}
         projected["content"] = ""
         projected["display_kind"] = "hidden"
+        # Only a PURE handoff (which becomes display_kind="hidden") is a compaction
+        # boundary. A merged carrier keeps its real prior-tail content and must NOT
+        # be flagged — flagging it would make Mercury render an "Earlier context was
+        # compressed" divider and DROP that real content.
+        projected["compaction_boundary"] = True
     return projected
 
 
@@ -3872,7 +3877,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
             "timestamp", "token_count", "input_tokens", "output_tokens", "finish_reason",
             "reasoning", "reasoning_content",
-            "display_kind", "attachments", "client_message_id")
+            "display_kind", "attachments", "client_message_id", "compaction_boundary")
         return {key: message.get(key) for key in safe_keys if key in message}
 
     async def _read_json_body(self, request: web.Request) -> tuple[dict[str, Any], Optional[web.Response]]:
