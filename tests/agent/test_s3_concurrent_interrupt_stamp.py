@@ -46,6 +46,7 @@ class _Done:
         self.duration = 0.1
         self.is_error = False
         self.blocked = False
+        self.data_use = frozenset()  # read by upstream's _append_batch_results
 
 
 class _Agent:

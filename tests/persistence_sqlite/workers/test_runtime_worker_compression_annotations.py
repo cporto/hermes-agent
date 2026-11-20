@@ -31,7 +31,11 @@ def test_compacted_messages_keep_current_row_ids_across_repeated_compaction(back
             else:
                 store.archive_and_compact(parent, messages, lock_holder='holder')
             current = store.scope['session_id']
-            assert messages[0]['_row_id'] != old_id
+            if rotate:
+                # A rotation moves the rows into the child session, so the id must change. A same-session
+                # no-op compaction keeps the unchanged leading rows in place (#82956, our carry): the id
+                # may be preserved, and the contract is only that it names the CURRENT active row.
+                assert messages[0]['_row_id'] != old_id
             assert holder._read_one('SELECT session_id,active FROM messages WHERE id=?',
                                     (messages[0]['_row_id'],))[:] == (current, 1)
     finally:

@@ -75,6 +75,8 @@ SESSION_RECORD_DEFAULTS: dict[str, Any] = {
     "auto_archived": False,
     "pinned": False,
     "hidden": False,
+    "complete": False,
+    "context_usage": None,
     "last_read_at": None,
     "tool_pin": None,
     "transcript_revision": 0,

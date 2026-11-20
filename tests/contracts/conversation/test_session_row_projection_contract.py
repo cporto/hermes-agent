@@ -43,7 +43,7 @@ def _cells(record, **cells):
         "compression_failure_cooldown_until": None, "compression_failure_error": None, "compression_fallback_streak": 0,
         "compression_ineffective_count": 0, "compression_recovery_deadline": None, "compression_overload_streak": 0,
         "profile_name": record.profile_name, "transport_profile": None, "rewind_count": 0, "archived": 0,
-        "auto_archived": 0, "pinned": 0, "hidden": 0, "last_read_at": None, "tool_names": None, "transcript_revision": 0,
+        "auto_archived": 0, "pinned": 0, "hidden": 0, "complete": 0, "context_usage": None, "last_read_at": None, "tool_names": None, "transcript_revision": 0,
         "prompt_cache_clock": None,
     }
     assert set(cells) <= set(row)

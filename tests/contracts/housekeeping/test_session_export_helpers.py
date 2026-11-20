@@ -31,7 +31,7 @@ _MESSAGE_KEYS = [
     "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name", "effect_disposition", "timestamp", "token_count",
     "finish_reason", "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items", "platform_message_id",
     "observed", "active", "compacted", "api_content", "display_kind", "display_metadata", "message_uid", "absorbed_message_uids",
-    "tool_call_uids", "tool_call_uid",
+    "tool_call_uids", "tool_call_uid", "attachments",
 ]
 
 
