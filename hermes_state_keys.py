@@ -68,6 +68,21 @@ def admission_fingerprint(*, canonical_target: str, payload: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def request_identity_payload(payload):
+    """The part of an admission payload that identifies *the request* for idempotent retry.
+
+    ``api_turn_v1.approval_session_key`` is a turn-unique run id minted fresh on every HTTP request
+    (a new ``chatcmpl-*`` id). It must stay in the stored payload (the producer binds it) but it cannot be
+    part of request identity, or a retry carrying the same Idempotency-Key could never match its first
+    admission. Only the retry-identity digests (``admit_session_input``, ``retry_terminal_admission``)
+    use this; every other fingerprint caller keeps hashing the payload as-is.
+    """
+    turn = payload.get('api_turn_v1') if isinstance(payload, dict) else None
+    if not isinstance(turn, dict) or 'approval_session_key' not in turn:
+        return payload
+    return {**payload, 'api_turn_v1': {k: v for k, v in turn.items() if k != 'approval_session_key'}}
+
+
 def local_identity(profile_id, principal_id, request_id):
     """The deterministic session id of a LOCAL creation receipt."""
     identity = json.dumps([profile_id, principal_id, request_id], separators=(',', ':'))

@@ -11,7 +11,7 @@ from agent.conversation_compression_archive import ABSORBED_ROW_IDS
 from agent.message_metadata import (
     CANONICAL_ROW, DB_ROW_SNAPSHOT, MESSAGE_UID, PERSISTENCE_ONLY_MESSAGE_FIELDS, TOOL_CALL_UID, TOOL_CALL_UIDS,
 )
-from hermes_state_keys import admission_fingerprint
+from hermes_state_keys import admission_fingerprint, request_identity_payload
 
 
 class SessionGoneEvent(NamedTuple):
@@ -142,7 +142,8 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
         request_id=request_id, payload=payload, intent=intent)
     if retired is not None:
         return retired
-    digest = admission_fingerprint(canonical_target=session_id, payload={'input': json.loads(encoded), 'intent': intent})
+    digest = admission_fingerprint(canonical_target=session_id,
+        payload={'input': request_identity_payload(json.loads(encoded)), 'intent': intent})
     def write(conn):
         _epoch(conn, epoch)
         _session(conn, session_id)
