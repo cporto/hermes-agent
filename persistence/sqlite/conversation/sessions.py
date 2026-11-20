@@ -52,7 +52,7 @@ from ._store.sessions import (
     list_sessions_rich, patch_session_model_config, promote_to_session_reset, publish_session_git_metadata,
     reopen_session, resolve_session_id, retire_undrained_queue_rows, search_sessions, session_count,
     session_count_by_source, session_count_ge, session_lifecycle_statuses, session_unread, set_session_archived,
-    set_session_hidden, set_session_pinned, set_session_read, set_session_yolo, touch_session_activity,
+    set_session_complete, set_session_hidden, set_session_pinned, update_session_context_usage, set_session_read, set_session_yolo, touch_session_activity,
     unarchive_recoverable_session, update_session_cwd, update_session_meta, update_session_model,
     update_session_runtime_lock, update_session_tool_names, update_system_prompt,
 )
@@ -212,6 +212,8 @@ def session_record(row: Mapping[str, Any]) -> SessionRecord:
         auto_archived=bool(row.get("auto_archived")),
         pinned=bool(row.get("pinned")),
         hidden=bool(row.get("hidden")),
+        complete=bool(row.get("complete")),
+        context_usage=row.get("context_usage"),
         last_read_at=row.get("last_read_at"),
         tool_pin=_tool_pin(row.get("tool_names")),
         transcript_revision=int(row.get("transcript_revision") or 0),
@@ -622,6 +624,16 @@ class SQLiteSessionRepository:
         holder = self._store.holder()
         with refusals(holder, session_id):
             return bool(set_session_hidden(holder, session_id, hidden))
+
+    def set_complete(self, session_id: SessionId, complete: bool) -> bool:
+        holder = self._store.holder()
+        with refusals(holder, session_id):
+            return bool(set_session_complete(holder, session_id, complete))
+
+    def update_context_usage(self, session_id: SessionId, usage: Mapping[str, JsonValue]) -> bool:
+        holder = self._store.holder()
+        with refusals(holder, session_id):
+            return bool(update_session_context_usage(holder, session_id, dict(usage)))
 
     def set_read(self, session_id: SessionId, read: bool = True) -> bool:
         holder = self._store.holder()

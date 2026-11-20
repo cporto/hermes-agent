@@ -452,6 +452,18 @@ class SessionTitlesConfigMixin:
         scope = self._backend.scope
         return bool(self._set_lineage_flag(scope, session_id, {"hidden": bool(hidden)}))
 
+    def set_complete(self, session_id: SessionId, complete: bool) -> bool:
+        scope = self._backend.scope
+        return bool(self._set_lineage_flag(scope, session_id, {"complete": bool(complete)}))
+
+    def update_context_usage(self, session_id: SessionId, usage: Mapping[str, JsonValue]) -> bool:
+        import json as _json
+        row = self._table(self._backend.scope).get(session_id)
+        if row is None:
+            return False
+        row["context_usage"] = _json.dumps(dict(usage), separators=(",", ":"))
+        return True
+
     def set_read(self, session_id: SessionId, read: bool = True) -> bool:
         scope = self._backend.scope
         return bool(self._set_lineage_flag(scope, session_id, {"last_read_at": time.time() if read else 0.0}))

@@ -202,7 +202,7 @@ def _session_row(session, entry=None) -> dict[str, Any]:
         "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason", "message_count",
         "tool_call_count", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd", "api_call_count", "parent_session_id", "pinned",
-        "archived", "hidden", "system_prompt")} | {"id": session.session_id, "model_config": dict(session.model_config)}
+        "archived", "hidden", "complete", "context_usage", "system_prompt")} | {"id": session.session_id, "model_config": dict(session.model_config)}
     if entry is not None:
         row.update(last_active=entry.last_active, preview=entry.preview)
         row.update({"_lineage_root_id": entry.lineage_root_id} if entry.lineage_root_id is not None else {})
@@ -3636,9 +3636,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         for flag in ("pinned", "archived", "hidden", "unread", "complete"):
             if flag in body and not isinstance(body[flag], bool):
                 return _error_response(f"'{flag}' must be a boolean", 400, code="invalid_session_field")
-        if "complete" in body:  # re-port pending: upstream's persistence layer has no per-session complete column/setter
-            return _error_response("Session 'complete' flag is not supported by this gateway build", 501,
-                                   code="session_complete_unsupported")
         store = self._store_beside(await self._ensure_store_async())
         if store is None:
             return self._session_db_unavailable()
@@ -3655,7 +3652,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             from session_retention import emit_session_deleted
             await asyncio.to_thread(emit_session_deleted, store.scope.profile_dir, change.archived_ids,
                                     reason="archive", primary=session_id)
-        for flag, setter in (("hidden", sessions.set_hidden), ("pinned", sessions.set_pinned)):
+        for flag, setter in (("hidden", sessions.set_hidden), ("pinned", sessions.set_pinned),
+                             ("complete", sessions.set_complete)):
             if flag in body:
                 await setter(session_id, body[flag])
         if "unread" in body:
@@ -5405,8 +5403,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         _ctx_sid = getattr(agent, "session_id", None) or session_id
                         # Empty occupancy or no window -> omit entirely (never write used=0).
                         if _ctx_used and _ctx_sid and _ctx_win > 0:
-                            # RE-PORT PENDING (persistence layer): the carry's store method
-                            # ``sessions.update_context_usage`` does not exist upstream; inert until provided.
                             _ctx_store = self._store_beside(self._ensure_store())
                             _ctx_update = getattr(getattr(_ctx_store, "sessions", None), "update_context_usage", None)
                             if _ctx_update is not None:

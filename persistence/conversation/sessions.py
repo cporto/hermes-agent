@@ -159,7 +159,7 @@ SESSION_ROW_COLUMNS: tuple[str, ...] = (
     "last_activity_provenance", "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
     "compression_failure_cooldown_until", "compression_failure_error", "compression_fallback_streak",
     "compression_ineffective_count", "compression_recovery_deadline", "compression_overload_streak", "profile_name",
-    "transport_profile", "rewind_count", "archived", "auto_archived", "pinned", "hidden", "last_read_at",
+    "transport_profile", "rewind_count", "archived", "auto_archived", "pinned", "hidden", "complete", "context_usage", "last_read_at",
     "tool_names", "transcript_revision", "prompt_cache_clock",
 )
 
@@ -466,6 +466,10 @@ class SessionRecord:
     tool_names: Optional[str] = None
     #: The stored prompt-cache clock, the JSON text of the last applied usage delta that carried one (``None`` when none did).
     prompt_cache_clock: Optional[str] = None
+    #: Fork carry (Mercury): the user marked the conversation done. Lineage state like ``pinned``/``hidden``.
+    complete: bool = False
+    #: Fork carry (Mercury): JSON text of the last context-gauge snapshot ``{used, window, model, threshold, updated_at}``.
+    context_usage: Optional[str] = None
 
     def as_session_row(self) -> dict[str, JsonValue]:
         return {**self._row_cells(), **self._marker_cells()}
@@ -482,6 +486,7 @@ class SessionRecord:
             "auto_archived": int(self.auto_archived),
             "pinned": int(self.pinned),
             "hidden": int(self.hidden),
+            "complete": int(self.complete),
             "tool_names": self.tool_names,
         }
         return {
@@ -1017,6 +1022,14 @@ class SessionRepository(Protocol):
 
     def set_hidden(self, session_id: SessionId, hidden: bool) -> bool:
         """Set ``hidden`` across the lineage."""
+        ...
+
+    def set_complete(self, session_id: SessionId, complete: bool) -> bool:
+        """Set the user-marked ``complete`` flag across the lineage (fork carry: Mercury's drawer Complete action)."""
+        ...
+
+    def update_context_usage(self, session_id: SessionId, usage: Mapping[str, JsonValue]) -> bool:
+        """Persist the session's last context-gauge snapshot (JSON) so a client can draw it on load. Best-effort metadata."""
         ...
 
     def set_read(self, session_id: SessionId, read: bool = True) -> bool:

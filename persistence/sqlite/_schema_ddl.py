@@ -186,6 +186,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     auto_archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     hidden INTEGER NOT NULL DEFAULT 0,
+    complete INTEGER NOT NULL DEFAULT 0,
+    context_usage TEXT,
     last_read_at REAL,
     tool_names TEXT,
     transcript_revision INTEGER NOT NULL DEFAULT 0,
@@ -224,7 +226,8 @@ CREATE TABLE IF NOT EXISTS messages (
     message_uid TEXT,
     absorbed_message_uids TEXT,
     tool_call_uids TEXT,
-    tool_call_uid TEXT
+    tool_call_uid TEXT,
+    attachments TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (

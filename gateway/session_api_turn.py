@@ -96,13 +96,8 @@ def _valid_browser_control(value):
 
 
 def _request_browser_control():
-    """The authenticated request's browser-controller identity, as the profile-prefix
-    middleware derived it from the served profile and its API key; never client JSON."""
-    from gateway.platforms.api_server import (
-        _api_request_browser_control_principal, _api_request_browser_control_transport_family)
-    bound = {'principal': _api_request_browser_control_principal.get(),
-             'transport_family': _api_request_browser_control_transport_family.get()}
-    return bound if _valid_browser_control(bound) else None
+    """Browser control was removed upstream; nothing is bound (a persisted 'browser_control' is accepted and ignored)."""
+    return None
 
 
 _SURFACE_RE = __import__('re').compile(r'^[a-z0-9|_-]{0,64}$')
@@ -124,20 +119,8 @@ def _request_surface():
 
 
 def _rebind_browser_control(adapter, data):
-    """Re-derive the admitted principal from the profile's current API key before it is bound
-    for execution (also after recovery). A rotated key no longer authorizes the old principal,
-    so that turn runs unbound, like a request the middleware stamped nothing for."""
-    bound = (data or {}).get('browser_control')
-    if bound is None:
-        return None
-    from gateway.platforms.api_server import _api_request_profile
-    profile = bound['principal'][len('principal:'):].rpartition(':')[0]
-    token = _api_request_profile.set(None if profile == 'default' else profile)
-    try:
-        expected = adapter._derive_browser_control_principal(profile)
-    finally:
-        _api_request_profile.reset(token)
-    return bound if hmac.compare_digest(bound['principal'], expected) else None
+    """Browser control was removed upstream: never rebind a persisted principal."""
+    return None
 
 
 def api_session_vars():
@@ -146,10 +129,7 @@ def api_session_vars():
     current = api_execution.get()
     if current is None:
         return {}
-    bound = current.get('browser_control') or {}
     return {'session_history_delivery': current['settings'].get('session_history_delivery') or '',
-            'browser_control_principal': bound.get('principal', ''),
-            'browser_control_transport_family': bound.get('transport_family', ''),
             'surface': current.get('surface') or ''}
 
 
@@ -465,11 +445,12 @@ async def _persist_context_usage(adapter, admitted, usage):
         used = max(0, int(used))
         window = int(usage.get('context_window') or 0)
         model = usage.get('model') or ''
-        db = adapter._ensure_session_db()
-        if db is None:
+        store = adapter._store_beside(await adapter._ensure_store_async())
+        if store is None:
             return
         if not model:
-            model = (db.get_session(session_id) or {}).get('model') or ''
+            _rec = await asyncio.to_thread(store.sessions.get, session_id)
+            model = (getattr(_rec, 'model', None) or '') if _rec is not None else ''
         if window <= 0 and model:
             from agent.model_metadata import get_model_context_length_async
             window = int(await get_model_context_length_async(model) or 0)
@@ -493,7 +474,7 @@ async def _persist_context_usage(adapter, admitted, usage):
         _payload = {'used': used, 'window': window, 'model': model, 'updated_at': time.time()}
         if threshold > 0:
             _payload['threshold'] = threshold
-        db.update_session_context_usage(session_id, _payload)
+        await asyncio.to_thread(store.sessions.update_context_usage, session_id, _payload)
     except Exception:
         logging.getLogger(__name__).debug('context_usage persist skipped', exc_info=True)
 

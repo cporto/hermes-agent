@@ -1023,6 +1023,24 @@ def set_session_hidden(holder: StoreHolder, session_id: str, hidden: bool) -> bo
     return _set_lineage_column(holder, "hidden", session_id, int(hidden))
 
 
+def set_session_complete(holder: StoreHolder, session_id: str, complete: bool) -> bool:
+    """Mark/unmark a session and its compression lineage complete (Mercury's drawer Complete action).
+    Lineage state exactly like archived/pinned/hidden: the root must not resurrect the old flag on refresh."""
+    return _set_lineage_column(holder, "complete", session_id, int(complete))
+
+
+def update_session_context_usage(holder: StoreHolder, session_id: str, payload: dict[str, Any]) -> bool:
+    """Persist the session's last context-gauge snapshot as compact JSON (tip row only: it describes the live context)."""
+    if not session_id:
+        return False
+    try:
+        blob = json.dumps(payload, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return False
+    return bool(holder._execute_write(
+        lambda conn: conn.execute("UPDATE sessions SET context_usage = ? WHERE id = ?", (blob, session_id)).rowcount))
+
+
 def set_session_read(holder: StoreHolder, session_id: str, read: bool = True) -> bool:
     """Mark read/unread across the compression lineage. ``last_read_at`` is a watermark: unread when
     activity postdates it (no write on the message path). NULL = never tracked = read; 0 = unread."""

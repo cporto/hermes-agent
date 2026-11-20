@@ -68,13 +68,13 @@ _REWIND_REFUSALS = {
 _MESSAGE_OPTIONALS = (
     "tool_name", "tool_call_id", "display_kind", "api_content", "platform_message_id", "effect_disposition",
     "finish_reason", "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items",
-    "codex_message_items", "token_count", "message_uid",
+    "codex_message_items", "token_count", "message_uid", "attachments",
 )
 _WIRE_FIELDS = (
     "role", "content", "timestamp", "tool_call_id", "tool_calls", "tool_name", "effect_disposition", "token_count",
     "finish_reason", "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items",
     "codex_message_items", "platform_message_id", "api_content", "display_kind", "display_metadata", "message_uid",
-    "absorbed_message_uids", "tool_call_uids", "tool_call_uid",
+    "absorbed_message_uids", "tool_call_uids", "tool_call_uid", "attachments",
 )
 _SIDECARS = ("reasoning_details", "codex_reasoning_items", "codex_message_items")
 
@@ -211,7 +211,8 @@ def _message_record(row: Mapping[str, Any]) -> MessageRecord:
         tool_call_id=row.get("tool_call_id"), display_kind=row.get("display_kind"),
         compressed_summary=bool(row.get("_compressed_summary")),
         visibility=_visibility(row.get("active"), row.get("compacted")), api_content=row.get("api_content"),
-        display_metadata=metadata, platform_message_id=row.get("platform_message_id"),
+        display_metadata=metadata, attachments=row.get("attachments") or None,
+        platform_message_id=row.get("platform_message_id"),
         observed=bool(row.get("observed")), effect_disposition=row.get("effect_disposition"),
         finish_reason=row.get("finish_reason"), reasoning=row.get("reasoning"),
         reasoning_content=row.get("reasoning_content"),
@@ -297,7 +298,7 @@ class SQLiteMessageRepository:
                 timestamp=message.timestamp, api_content=message.api_content, display_kind=message.display_kind,
                 display_metadata=msg.get("display_metadata"),
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds,
-                message_uid=message.message_uid))
+                message_uid=message.message_uid, attachments=msg.get("attachments")))
 
     def append_batch(self, session_id: SessionId, messages: Sequence[NewMessage], *,
                      turn_lease_holder: Optional[str] = None,

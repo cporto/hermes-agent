@@ -111,6 +111,8 @@ def blank_session_row(session_id: str, *, lineage_kind: Any, model_config: Optio
         "auto_archived": False,
         "pinned": False,
         "hidden": False,
+        "complete": False,
+        "context_usage": None,
         # Epoch watermark: None is never tracked (read), 0.0 is explicitly unread.
         "last_read_at": None,
         "expiry_finalized": False,
@@ -293,6 +295,8 @@ class InMemorySessionRepository(SessionTitlesConfigMixin, SessionDeleteMixin, Se
             auto_archived=bool(row.get("auto_archived")),
             pinned=bool(row["pinned"]),
             hidden=bool(row["hidden"]),
+            complete=bool(row.get("complete")),
+            context_usage=row.get("context_usage"),
             last_read_at=row.get("last_read_at"),
             tool_pin=stored_tool_pin(row["tool_pin"]) if resolve_tool_pin else None,
             transcript_revision=row.get("transcript_revision", 0),

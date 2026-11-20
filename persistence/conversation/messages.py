@@ -155,6 +155,8 @@ class NewMessage:
     compressed_summary: bool = False
     api_content: Optional[str] = None
     display_metadata: Optional[dict[str, JsonValue]] = None
+    #: Fork carry (Mercury): image refs ``[{url, mime?}]`` persisted beside the ``[screenshot]`` text projection.
+    attachments: Optional[list[dict[str, JsonValue]]] = None
     platform_message_id: Optional[str] = None
     observed: bool = False
     effect_disposition: Optional[str] = None
@@ -200,7 +202,8 @@ class NewMessage:
             tool_calls=tuple(tool_calls) if isinstance(tool_calls, (list, tuple)) else (),
             tool_name=get("tool_name"), tool_call_id=get("tool_call_id"), display_kind=get("display_kind"),
             compressed_summary=bool(get("_compressed_summary")), api_content=get("api_content"),
-            display_metadata=get("display_metadata"), platform_message_id=get("platform_message_id") or get("message_id") or None,
+            display_metadata=get("display_metadata"), attachments=get("attachments") or None,
+            platform_message_id=get("platform_message_id") or get("message_id") or None,
             observed=bool(get("observed")), effect_disposition=get("effect_disposition"), finish_reason=get("finish_reason"),
             reasoning=get("reasoning"), reasoning_content=get("reasoning_content"), reasoning_details=get("reasoning_details"),
             codex_reasoning_items=get("codex_reasoning_items"), codex_message_items=get("codex_message_items"),
@@ -457,6 +460,8 @@ class MessageRecord:
     visibility: RowVisibility
     api_content: Optional[str] = None
     display_metadata: Optional[dict[str, JsonValue]] = None
+    #: Fork carry (Mercury): image refs ``[{url, mime?}]`` persisted beside the ``[screenshot]`` text projection.
+    attachments: Optional[list[dict[str, JsonValue]]] = None
     platform_message_id: Optional[str] = None
     observed: bool = False
     effect_disposition: Optional[str] = None
@@ -829,7 +834,7 @@ _WIRE_ROW_KEYS = (
     "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content", "reasoning_details",
     "codex_reasoning_items", "codex_message_items", "platform_message_id", "observed", "active", "compacted",
     "api_content", "display_kind", "display_metadata", "message_uid", "absorbed_message_uids", "tool_call_uids",
-    "tool_call_uid",
+    "tool_call_uid", "attachments",
 )
 
 
@@ -867,6 +872,7 @@ class TranscriptRow:
     absorbed_message_uids: Optional[str] = None
     tool_call_uids: Optional[str] = None
     tool_call_uid: Optional[str] = None
+    attachments: Optional[list[dict[str, JsonValue]]] = None
 
     def as_wire_row(self) -> dict[str, JsonValue]:
         active, compacted = {

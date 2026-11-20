@@ -83,6 +83,66 @@ def _decode_content(content: Any) -> Any:
     return content
 
 
+def _encode_attachments(attachments: Any) -> Optional[str]:
+    """Serialize ``attachments`` (a list of image refs ``{url, mime?}``) for its TEXT column. An already-serialized
+    JSON string passes through, not double-encoded (same defence as ``_encode_display_metadata``)."""
+    if attachments is None or attachments == "":
+        return None
+    if isinstance(attachments, str):
+        return attachments
+    try:
+        return json.dumps(attachments)
+    except (TypeError, ValueError):
+        return None
+
+
+def _decode_attachments(attachments: Any) -> list[dict[str, Any]]:
+    """Parse the ``attachments`` TEXT column back into a list of image refs; ``[]`` for absent/malformed
+    values so no caller ever re-embeds the raw JSON string."""
+    if not attachments:
+        return []
+    if not isinstance(attachments, str):
+        return [a for a in attachments if isinstance(a, dict)] if isinstance(attachments, (list, tuple)) else []
+    try:
+        value = json.loads(attachments)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [a for a in value if isinstance(a, dict)] if isinstance(value, list) else []
+
+
+def _attachments_from_message(msg: dict[str, Any]) -> Any:
+    """Image refs to persist for ``msg``: the caller-set ``attachments`` if present, else extracted from the image
+    parts of a multimodal ``content`` list (``mime`` parsed from a ``data:`` URL). The durable text projection
+    keeps ``[screenshot]``; this sibling column is what lets history render the image again."""
+    existing = msg.get("attachments")
+    if existing not in (None, ""):
+        return existing
+    content = msg.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    image_types = {"image_url"}
+    try:
+        from agent.session_persistence import _IMAGE_PART_TYPES
+        image_types = set(_IMAGE_PART_TYPES)
+    except Exception:
+        pass
+    out: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") not in image_types:
+            continue
+        img = part.get("image_url")
+        url = (img or {}).get("url") if isinstance(img, dict) else None
+        if not isinstance(url, str) or not url:
+            continue
+        entry: dict[str, Any] = {"url": url}
+        if url.startswith("data:"):
+            mime = url[5:].partition(",")[0].split(";")[0]
+            if mime:
+                entry["mime"] = mime
+        out.append(entry)
+    return out or None
+
+
 def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
     """Serialize ``display_metadata`` for its TEXT column; an already-serialized JSON string
     (import/replace paths) is not double-encoded."""
@@ -216,7 +276,8 @@ def _message_row_params(holder: StoreHolder, session_id: str, role: str, msg: di
         _str_or_none(msg.get("api_content")), _str_or_none(msg.get("display_kind")),
         display_metadata, _display_identity(_display_dedupe_key(holder, identity_row)),
         message_uid_or_none(msg), _absorbed_uids_json(msg),
-        _tool_call_uids_json(msg), _tool_call_uid_or_none(msg))
+        _tool_call_uids_json(msg), _tool_call_uid_or_none(msg),
+        _encode_attachments(_attachments_from_message(msg)))
 
 
 def _stamp_tool_call_uids(msg: dict[str, Any], tool_calls: Any, batch_index: dict[str, str]) -> None:
@@ -322,7 +383,7 @@ def append_message(
     api_content: Optional[str] = None, display_kind: Optional[str] = None,
     display_metadata: Optional[dict[str, Any]] = None, compression_lock_holder: Optional[str] = None,
     turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
-    message_uid: Optional[str] = None) -> int:
+    message_uid: Optional[str] = None, attachments: Any = None) -> int:
     """Append one message; returns the row id and bumps the session counters. ``platform_message_id``:
     the platform's own id. ``api_content``: byte-fidelity sidecar, the exact string sent to the API when
     it differed from ``content``, stored as sent except lone surrogates. ``message_uid``: the id a caller
@@ -1299,6 +1360,8 @@ def _row_to_message_dict(holder: StoreHolder, row, *, warn_context: str, summary
             msg["tool_calls"], [], f"Failed to deserialize tool_calls in {warn_context}, falling back to []")
     if msg.get("display_metadata") is not None:
         msg["display_metadata"] = _decode_display_metadata(msg["display_metadata"])
+    if msg.get("attachments") is not None:
+        msg["attachments"] = _decode_attachments(msg["attachments"]) or None
     # A `SELECT *` picks up every column, including any BLOB added to the schema later; the
     # JSON encoder that serves these dicts over HTTP fails outright on raw bytes. Drop them
     # here, once, rather than needing a new named pop for each future binary column. Known

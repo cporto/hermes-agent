@@ -217,6 +217,12 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
         ('32 2026-10-18T10:11Z 1fc1999769', (('+', 'transcript_revision', 'tool_names'),)),
         # Last prompt-cache event (agent/prompt_cache_clock.py), JSON; written with the token batch.
         ('33 2026-11-15T12:00Z feat/prompt-cache-clock', (('+', 'prompt_cache_clock', 'transcript_revision'),)),
+        # Fork carries (Mercury): user-marked-done flag + last context-usage snapshot (JSON); both already
+        # exist on the fork's live store, so ADD COLUMN is a no-op there.
+        ('34 2026-11-20T15:00Z carry/complete-context-usage', (
+            ('+', 'complete', 'hidden'),
+            ('+', 'context_usage', 'complete'),
+        )),
         ),
     ),
     "messages": _TableHistory(
@@ -256,6 +262,8 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
             ('+', 'tool_call_uids', 'absorbed_message_uids'),
             ('+', 'tool_call_uid', 'tool_call_uids'),
         )),
+        # Fork carry (Mercury): image refs persisted beside the text projection (JSON list of {url,mime}).
+        ('17 2026-11-20T15:00Z carry/attachments', (('+', 'attachments', 'tool_call_uid'),)),
         ),
     ),
     "session_model_usage": _TableHistory(
