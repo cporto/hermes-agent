@@ -4985,17 +4985,47 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 # P3 Slice 2 bridge: the run's event channel lives only for the
-                # IN-PROGRESS window (a subscriber that joined mid-run already got
-                # its terminal sentinel). Drop the transport now so ownership
-                # releases at terminal like the pre-existing contract expects
-                # (completed-run catch-up is served by refreshLive()/transcript,
-                # not this stream — see gate review). Mirrors _drop_run_transport.
-                self._run_streams.pop(run_id, None)
-                self._run_streams_created.pop(run_id, None)
-                self._release_run_owner_if_forgotten(run_id)
+                # IN-PROGRESS window. It is dropped by _pump_run_events AFTER the terminal
+                # sentinel has been mirrored (dropping it here, before the pump had read the
+                # terminal frames, left attached subscribers with keepalives forever).
                 await events.flush()
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
+
+        # Single reader of the run's event queue. It fans every frame out to (a) the replayable run
+        # stream (GET /v1/runs/{id}/events) and (b) this POST response via ``viewer_q``. It must NOT
+        # live in the POST response loop below: on a clean client disconnect that loop exits while the
+        # run keeps going by design, and a reconnecting device would then replay only the frames up to
+        # the drop. The terminal sentinel is mirrored BEFORE the run stream is released, so attached
+        # subscribers get a clean ``: stream closed`` instead of keepalives forever.
+        viewer_q: asyncio.Queue = asyncio.Queue()
+        viewer = {"alive": True}
+
+        async def _pump_run_events() -> None:
+            try:
+                while True:
+                    item = await queue.get()
+                    mirror = self._run_streams.get(run_id)
+                    if item is None:
+                        if mirror is not None:
+                            mirror.put_nowait(None)
+                        if viewer["alive"]:
+                            viewer_q.put_nowait(None)
+                        return
+                    name, payload = item
+                    if mirror is not None:
+                        mirror.put_nowait({"event": name, "run_id": run_id,
+                                           "timestamp": time.time(), **payload})
+                    if viewer["alive"]:
+                        viewer_q.put_nowait(item)
+            finally:
+                # Release the transport so ownership drops at terminal, as before (completed-run
+                # catch-up is served by refreshLive()/transcript, not this stream).
+                self._run_streams.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
+                self._release_run_owner_if_forgotten(run_id)
+
+        self._track_background_task(asyncio.create_task(_pump_run_events()))
 
         # NOT in _active_run_tasks: _run_agent already counts this turn for the shutdown drain.
         task = asyncio.create_task(_run_and_signal())
@@ -5004,25 +5034,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         try:
             while True:
                 try:
-                    item = await asyncio.wait_for(queue.get(), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
+                    item = await asyncio.wait_for(viewer_q.get(), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
                 except TimeoutError:
                     await response.write(b": keepalive\n\n")
                     continue
                 if item is None:
-                    # Terminal sentinel: mirror it into the run stream so replay + follow
-                    # (GET /v1/runs/{id}/events) sees a clean stream close, then stop.
-                    _mirror = self._run_streams.get(run_id)
-                    if _mirror is not None:
-                        _mirror.put_nowait(None)
-                    break
+                    break  # terminal sentinel (already mirrored into the run stream by the pump)
                 name, payload = item
-                # Mirror this frame into the run stream unchanged in name/shape (its own
-                # seq is assigned by _RunStream, so Last-Event-ID replay lines up); the
-                # POST /chat/stream response below is untouched.
-                _mirror = self._run_streams.get(run_id)
-                if _mirror is not None:
-                    _mirror.put_nowait({"event": name, "run_id": run_id,
-                                        "timestamp": time.time(), **payload})
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Slice 3: a CLEAN client disconnect no longer interrupts the run. The
@@ -5041,6 +5059,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             raise
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
+        finally:
+            viewer["alive"] = False  # the pump keeps mirroring into the run stream regardless
         return response
 
     def _register_session_stream_approval(self, run_id: str, events: _SessionEventQueue, message_id: str):
