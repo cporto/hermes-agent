@@ -114,6 +114,76 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
+# Secrets are loaded once at module import time for the active profile's home.
+# __SECRETS caches the mapping from secret values to placeholders.
+# If HERMES_HOME does not exist or changes to a different profile, the secrets cache is ignored.
+# When __SECRETS is populated, every call to _redact_known_secrets() uses the same cache.
+# To fully refresh secrets, import the module again (e.g., process restart).
+__SECRETS: dict[str, str] = {}
+
+
+def _redact_known_secrets(text: str) -> str:
+    """Replace every known secret value with a <REDACTED:name> placeholder.
+
+    Known secrets are discovered once per module load: values from files in
+    <hermes_home>/secrets/ and key=value pairs in <hermes_home>/.env.
+
+    - Secrets < 8 characters are ignored.
+    - Longest values are replaced first to avoid partial substitutions.
+    - On any error, the original text is returned unchanged.
+    """
+    try:
+        # If we already have a populated cache from a prior import, use it.
+        # __SECRETS is a module-level variable and persists across calls within this process.
+        if __SECRETS:
+            # Apply cached secrets
+            sorted_secrets = sorted(__SECRETS.items(), key=lambda x: len(x[0]), reverse=True)
+            for value, placeholder in sorted_secrets:
+                text = text.replace(value, placeholder)
+            return text
+
+        # Discover secrets from the active profile's home
+        home = get_hermes_home().resolve()
+
+        # Load secrets from files directly under <hermes_home>/secrets/
+        secrets_dir = home / "secrets"
+        if secrets_dir.is_dir():
+            for filename in secrets_dir.iterdir():
+                if filename.is_file():
+                    try:
+                        content = filename.read_text().strip()
+                        if len(content) >= 8:
+                            __SECRETS[content] = f"<REDACTED:{filename.name}>"
+                    except OSError:
+                        # File not readable; continue with others.
+                        pass
+
+        # Load secrets from key=value pairs in <hermes_home>/.env
+        env_file = home / ".env"
+        if env_file.is_file():
+            try:
+                env_content = env_file.read_text()
+                for line in env_content.splitlines():
+                    match = re.match(r"^([A-Za-z0-9_]+)=", line)
+                    if match:
+                        name = match.group(1)
+                        value = line[match.end():].strip()
+                        if len(value) >= 8:
+                            __SECRETS[value] = f"<REDACTED:{name}>"
+            except OSError:
+                pass
+
+        # Apply discovered secrets (no re-walk if __SECRETS was already populated)
+        if __SECRETS:
+            sorted_secrets = sorted(__SECRETS.items(), key=lambda x: len(x[0]), reverse=True)
+            for value, placeholder in sorted_secrets:
+                text = text.replace(value, placeholder)
+
+        return text
+
+    except Exception:
+        # On any failure, return the original text unchanged
+        return text
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -3388,6 +3458,7 @@ def save_job_output(job_id: str, output: str):
     _ensure_cron_dir(job_output_dir)
     _secure_dir(job_output_dir)
     output_file = job_output_dir / f"{_hermes_now().strftime('%Y-%m-%d_%H-%M-%S')}.md"
+    output = _redact_known_secrets(output)
     atomic_write_text(output_file, output, tmp_prefix=".output_", mode=0o600)
     _secure_file(output_file)
     # Bound per-job output growth so long-running deploys don't fill the disk (#52383).
