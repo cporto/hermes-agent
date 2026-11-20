@@ -7,9 +7,12 @@ terminal sentinel (a clean ``: stream closed``) instead of keepalives forever.
 
 import asyncio
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from aiohttp import ClientSession, TCPConnector, web
+from aiohttp.test_utils import TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
@@ -153,4 +156,82 @@ async def test_disconnected_client_still_gets_terminal_close_for_attached_subscr
     while not sub.empty():
         seen.append(sub.get_nowait())
     assert seen and seen[-1][1] is None
+    assert stream.terminal
+
+
+# ---------------------------------------------------------------------------------------------
+# Real TCP disconnect. aiohttp CANCELS the handler when the client goes away while the handler is
+# idle between frames (the usual case for a backgrounded phone); that path used to interrupt the
+# agent, contradicting "a clean client disconnect keeps the run going".
+# ---------------------------------------------------------------------------------------------
+class _SlowAgent:
+    session_prompt_tokens = session_completion_tokens = session_total_tokens = 0
+
+    def __init__(self, session_id, cb, log):
+        self.session_id, self._cb, self.log = session_id, cb, log
+
+    def interrupt(self, message=None):
+        self.log.append("interrupt")
+
+    def run_conversation(self, user_message, conversation_history, task_id):
+        del user_message, conversation_history, task_id
+        for i in range(12):
+            self._cb(f"w{i} ")
+            time.sleep(0.25)
+        self.log.append("agent_finished")
+        return {"final_response": "all done", "session_id": self.session_id}
+
+
+async def _real_disconnect(adapter, session_db):
+    session_id = session_db.create_session("real-disconnect", "api_server")
+    log: list[str] = []
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    with patch.object(
+        adapter, "_get_existing_session_or_404", return_value=({"id": session_id}, None)
+    ), patch.object(
+        adapter, "_read_json_body", return_value=({"message": "go"}, None)
+    ), patch.object(
+        adapter, "_create_agent",
+        side_effect=lambda **kw: _SlowAgent(session_id, kw["stream_delta_callback"], log),
+    ):
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            async with ClientSession(connector=TCPConnector(force_close=True)) as cs:
+                resp = await cs.post(
+                    server.make_url(f"/api/sessions/{session_id}/chat/stream"), json={"message": "go"}
+                )
+                seen = 0
+                async for line in resp.content:
+                    if line.startswith(b"event: assistant.delta"):
+                        seen += 1
+                    if seen >= 2:
+                        break
+                resp.close()  # the phone goes away mid-reply
+            run_id = next(iter(adapter._run_streams))
+            stream = adapter._run_streams[run_id]
+            for _ in range(150):
+                await asyncio.sleep(0.1)
+                if stream.terminal:
+                    break
+            await asyncio.sleep(0.3)
+            return log, stream
+        finally:
+            await server.close()
+
+
+@pytest.mark.asyncio
+async def test_real_client_disconnect_does_not_interrupt_the_run(adapter, session_db):
+    log, _stream = await _real_disconnect(adapter, session_db)
+    assert "interrupt" not in log, "an idle-time client disconnect interrupted a run that should keep going"
+    assert "agent_finished" in log
+
+
+@pytest.mark.asyncio
+async def test_real_client_disconnect_replay_gets_every_frame_and_terminal(adapter, session_db):
+    _log, stream = await _real_disconnect(adapter, session_db)
+    names = [(ev or {}).get("event") for _seq, ev in stream.backlog]
+    assert len([n for n in names if n == "assistant.delta"]) == 12
+    assert names[-2:] == ["done", None] or (names[-1] is None and "run.completed" in names)
     assert stream.terminal

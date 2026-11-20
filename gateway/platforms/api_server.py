@@ -5053,9 +5053,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 shield_wait=False, keep_running=True)
             logger.info("Session SSE client disconnected; run %s continues in background", run_id)
         except asyncio.CancelledError:
+            # aiohttp cancels the handler when the client goes away while the handler is idle between
+            # frames (a backgrounded phone, a dropped link): that is the SAME clean disconnect as the
+            # write error above, so the run must keep going and a reconnecting device catches up via
+            # /v1/runs/{id}/events. Only a cancel with the transport still open (server shutdown)
+            # keeps the interrupting drain.
+            transport = getattr(request, "transport", None)
+            client_gone = transport is None or transport.is_closing()
             await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE task cancelled", shield_wait=True)
-            logger.info("Session SSE task cancelled; drained live run %s", run_id)
+                run_id, task, interrupt_message="SSE task cancelled", shield_wait=True,
+                keep_running=client_gone)
+            if client_gone:
+                logger.info("Session SSE client disconnected (handler cancelled); run %s continues in background", run_id)
+            else:
+                logger.info("Session SSE task cancelled; drained live run %s", run_id)
             raise
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
