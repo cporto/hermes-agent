@@ -32,6 +32,8 @@ def test_compaction_merges_and_removes_lineage_markers_with_config(backend, scop
     record = store_a.sessions.get("session")
     assert record.model_config == {"_delegate_from": "origin", "_branched_from": "branch"}
     assert (record.lineage_kind, record.lineage_origin_id) == (SessionLineageKind.DELEGATE, "origin")
+    # A distinct second summary: an identical one is a no-op pass that keeps its row in place (#82956), so it would not add the archived generation this test counts.
+    message = NewMessage("user", "summary two", timestamp=1790553601.0)
     store_a.messages.compact("session", [message], model_config_patch={"_delegate_from": None, "ok": 2})
     record = store_a.sessions.get("session")
     assert record.model_config == {"_branched_from": "branch", "ok": 2}

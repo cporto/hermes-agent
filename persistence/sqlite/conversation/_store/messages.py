@@ -863,7 +863,9 @@ def _archive_named_rows(
     # (the no-op / "method:none" case, N -> N) keeps its rows in place (id and message_uid stamped,
     # still active) instead of being archived and re-inserted, which doubled the stored rows per pass.
     live = conn.execute(_LIVE_IDENTITY_SQL, (session_id, len(compacted_messages) + 1)).fetchall()
-    kept = _stamp_kept_live_prefix(holder, live, compacted_messages)
+    # Only a pure no-op pass keeps rows in place: any carried/held/tail work means the contract rewinds or archives
+    # those originals, so a row it names must never be kept live.
+    kept = 0 if (carried_messages or tail_count > 0) else _stamp_kept_live_prefix(holder, live, compacted_messages)
     kept_ids = [int(row[0]) for row in live[:kept]]
     kept_set = set(kept_ids)
     kept_tool_calls = sum(_tool_calls_len(row[4], scalar=1) for row in live[:kept])
@@ -1008,7 +1010,9 @@ def _archive_and_compact_on_conn(
     # (the no-op / "method:none" case, N -> N) keeps its rows in place (id and message_uid stamped,
     # still active) instead of being archived and re-inserted, which doubled the stored rows per pass.
     live = conn.execute(_LIVE_IDENTITY_SQL, (session_id, len(compacted_messages) + 1)).fetchall()
-    kept = _stamp_kept_live_prefix(holder, live, compacted_messages)
+    # Only a pure no-op pass keeps rows in place: any carried/held/tail work means the contract rewinds or archives
+    # those originals, so a row it names must never be kept live.
+    kept = 0 if (carried_messages or tail_count > 0) else _stamp_kept_live_prefix(holder, live, compacted_messages)
     kept_ids = [int(row[0]) for row in live[:kept]]
     kept_set = set(kept_ids)
     kept_tool_calls = sum(_tool_calls_len(row[4], scalar=1) for row in live[:kept])
