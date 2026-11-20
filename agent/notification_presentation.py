@@ -70,6 +70,8 @@ def notification_turn(agent, *, muted: bool, session_id: str = "", display_kind:
         yield
     finally:
         for key, value in saved.items():
+            if not muted and key != "_notification_user_display_kind":
+                continue  # unmuted turns leave presentation callbacks as the turn set them (upstream parity)
             if value is not missing:
                 setattr(agent, key, value)
             elif getattr(agent, key, missing) is not missing:

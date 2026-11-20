@@ -1481,7 +1481,8 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     release_worker = threading.Event()
     cleanup_done = threading.Event()
     fake_db = MagicMock()
-    fake_db.get_compression_failure_cooldown.return_value = None
+    handle = MagicMock()
+    handle.messages.read_compression_cooldown.return_value = None
 
     class StreamingCompressAgent:
         last_instance = None
@@ -1566,6 +1567,7 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
+    monkeypatch.setattr(GatewayRunner, "persistence", handle)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -1627,7 +1629,7 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     ), f"turn-hold must send deferral notice, got: {sent_contents}"
 
     # Behavior witness 2: turn-hold must NOT advance the failure STREAK.
-    fake_db.get_compression_failure_cooldown.assert_called()
+    handle.messages.read_compression_cooldown.assert_called()
     # The escalating ladder (x1, x3, x9) is reserved for real failures via
     # _hygiene_cooldown_for_failure -> increment_hygiene_failure_streak.
     # The turn-hold path records only a flat, non-escalating retry-after
@@ -1635,9 +1637,9 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     # cancel a fresh compressor every turn) and must never touch the streak.
     assert not fake_db.increment_hygiene_failure_streak.called, \
         "turn-hold must not advance the failure streak"
-    assert fake_db.record_compression_failure_cooldown.called, \
+    assert handle.messages.record_compression_cooldown.called, \
         "turn-hold must record the flat retry-after spacing"
-    _th_args = fake_db.record_compression_failure_cooldown.call_args[0]
+    _th_args = handle.messages.record_compression_cooldown.call_args[0]
     import time as _time_mod
     _th_retry = _th_args[1] - _time_mod.time()
     assert _th_retry <= 120, (
@@ -1806,91 +1808,6 @@ async def test_progressing_hygiene_worker_hits_wall_clock_ceiling(monkeypatch, t
 # Cooldown persistence across gateway restarts (#74136)
 # ---------------------------------------------------------------------------
 
-def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_id):
-    """Scaffolding for the restart-persistence tests: a fresh GatewayRunner
-    wired to a REAL AsyncSessionDB facade (not a MagicMock) so the hygiene
-    cooldown check/write paths exercise the actual SQLite-backed methods."""
-    from hermes_state import AsyncSessionDB
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = agent_cls
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-    cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(
-        "compression:\n"
-        "  enabled: true\n"
-        "  hygiene_failure_cooldown_seconds: 300\n",
-        encoding="utf-8",
-    )
-
-    gateway_run = importlib.import_module("gateway.run")
-    GatewayRunner = gateway_run.GatewayRunner
-
-    adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
-    runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
-    )
-    runner.adapters = {Platform.TELEGRAM: adapter}
-    runner._voice_mode = {}
-    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
-    runner.session_store = MagicMock()
-    runner.session_store.get_or_create_session.return_value = SessionEntry(
-        session_key="agent:main:telegram:dm:12345",
-        session_id=session_id,
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-    )
-    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
-    runner.session_store.has_any_sessions.return_value = True
-    runner.session_store.rewrite_transcript = MagicMock()
-    runner.session_store.append_to_transcript = MagicMock()
-    runner._running_agents = {}
-    runner._pending_messages = {}
-    runner._pending_approvals = {}
-    # The real async facade over the real SQLite-backed SessionDB — the
-    # production shape.  A SimpleNamespace(_db=MagicMock()) here would let
-    # the assertion pass against methods that don't actually persist.
-    runner._session_db = AsyncSessionDB(session_db)
-    runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "ok",
-            "messages": [],
-            "tools": [],
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-        }
-    )
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
-    monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
-    )
-
-    event = MessageEvent(
-        text="hello",
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id="12345",
-            chat_type="dm",
-            user_id="12345",
-        ),
-        message_id="1",
-    )
-    return runner, adapter, event
-
-
 @pytest.mark.asyncio
 
 
@@ -1900,8 +1817,6 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
     """Once the commit fence is cancelled, the host must stop extending the
     wait — even if the shielded worker is still alive and touching progress.
     """
-    from hermes_state import SessionDB
-
     worker_started = threading.Event()
     release_worker = threading.Event()
     cleanup_done = threading.Event()
@@ -1940,9 +1855,9 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
                 time.sleep(0.02)
             return (messages, None)
 
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     try:
-        db.create_session(session_id, "telegram")
+        seed_session(db, session_id, "telegram")
         runner, adapter, event = _make_cooldown_runner(
             monkeypatch, tmp_path, HungAfterFenceCancelAgent, db, session_id
         )
@@ -1957,8 +1872,9 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
             "must not extend toward the 600s ceiling (#96953)"
         )
         assert runner._run_agent.await_count == 1
-        state = db.get_compression_failure_cooldown(session_id)
-        assert state is not None and state["remaining_seconds"] > 0
+        _now = time.time()
+        state = db.messages.read_compression_cooldown(session_id, _now)
+        assert state is not None and state.until - _now > 0
         assert not any(
             "Context compression timed out" in s["content"] for s in adapter.sent
         ), "fence-cancel is not a summary-model timeout; no timeout toast"
@@ -1977,8 +1893,6 @@ async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path):
     ``except BaseException`` used to revoke the fence and re-raise with no
     cooldown, so the next turn after /restart re-triggered hygiene immediately.
     """
-    from hermes_state import SessionDB
-
     worker_started = threading.Event()
     release_worker = threading.Event()
     cleanup_done = threading.Event()
@@ -2005,9 +1919,9 @@ async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path):
             release_worker.wait(timeout=5)
             return (messages, None)
 
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     try:
-        db.create_session(session_id, "telegram")
+        seed_session(db, session_id, "telegram")
         runner, _adapter, event = _make_cooldown_runner(
             monkeypatch, tmp_path, SlowCompressAgent, db, session_id
         )
@@ -2016,8 +1930,9 @@ async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path):
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        state = db.get_compression_failure_cooldown(session_id)
-        assert state is not None and state["remaining_seconds"] > 0, (
+        _now = time.time()
+        state = db.messages.read_compression_cooldown(session_id, _now)
+        assert state is not None and state.until - _now > 0, (
             "hygiene unwind did not persist a cooldown; got "
             f"{state!r}"
         )
