@@ -51,6 +51,9 @@ async def test_notification_projection_preserves_source_outcome(tmp_path, monkey
     assert bool(result.get("_notification_presentation_suppressed")) is muted
     assert result["failed"] is True and result["error"] == "failure details"
     assert result["messages"] == expected["messages"]
+    # Carried (2d67cd363b): every finished turn reports the served runtime; Mercury displays it.
+    runtime = usage.pop("runtime")
+    assert isinstance(runtime, dict) and "route_source" in runtime
     assert usage == {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
     assert delivered == ([] if muted else ["execution evidence"])
     assert agent.stream_delta_callback is callback
