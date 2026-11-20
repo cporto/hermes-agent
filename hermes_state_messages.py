@@ -928,6 +928,14 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         compacted transcript, then clone them so they stay live and searchable once each.
         """
         active_ids = [int(row["id"]) for row in conn.execute(_ACTIVE_IDS_SQL, (session_id,)).fetchall()]
+        # Preserve the in-order prefix of compacted_messages already present verbatim as the leading live
+        # rows (the no-op / "method:none" case, messages N -> N): stamp each with its existing _row_id and
+        # message_uid, and keep them active in place instead of archiving and re-inserting them (#82956).
+        live = conn.execute(_LIVE_IDENTITY_SQL, (session_id, len(compacted_messages) + 1)).fetchall()
+        kept = self._stamp_kept_live_prefix(live, compacted_messages)
+        kept_ids = [int(row[0]) for row in live[:kept]]
+        kept_set = set(kept_ids)
+        kept_tool_calls = sum(_tool_calls_len(row[4], scalar=1) for row in live[:kept])
         # Fixed identity for mid-run steers: a steer is ONE logical message (message_uid minted
         # once, never content-derived). Compaction must not rewind+clone it, or each in-place
         # compaction appends a duplicate active row (observed: 1 steer -> N+1 rows across N
@@ -941,9 +949,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         covered_set = set(covered)
         carried_ids = self._resolve_carried_row_ids(conn, session_id, carried_messages or [])
         covered_set.update(carried_ids)
-        unseen = [row_id for row_id in active_ids if row_id not in covered_set and row_id not in steer_ids]
-        covered_active = [row_id for row_id in active_ids if row_id in covered_set]
-        rewind_ids = [row_id for row_id in carried_ids if row_id not in steer_ids]
+        unseen = [row_id for row_id in active_ids if row_id not in covered_set and row_id not in steer_ids
+                  and row_id not in kept_set]
+        covered_active = [row_id for row_id in active_ids if row_id in covered_set and row_id not in kept_set]
+        rewind_ids = [row_id for row_id in carried_ids if row_id not in steer_ids and row_id not in kept_set]
         if tail_count > 0:
             rewind_ids += [
                 row_id for row_id in self._tail_originals(covered_active, tail_count, merged_away)
@@ -957,7 +966,11 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                 "UPDATE messages SET active = 0, compacted = 0 "
                 f"WHERE session_id = ? AND id IN ({placeholders})",
                 [session_id, *rewind_ids])
-        conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
+        if kept_ids:
+            _kept_ph = _placeholders(kept_ids)
+            conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({_kept_ph})", [session_id, *kept_ids])
+        else:
+            conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
         # The archive sweep sets every active row to active=0, compacted=1, so restore the exempted
         # steer rows (same id, active=1, compacted=0) to keep one steer = one active row forever.
         if steer_ids:
@@ -974,7 +987,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # exists only to keep it in model context, not to add a row. Drop steer dicts from the insert set.
         if compacted_messages:
             compacted_messages = [
-                m for m in compacted_messages
+                m for m in compacted_messages[kept:]
                 if not (isinstance(m, dict) and m.get("display_kind") == "steer")
             ]
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
@@ -986,6 +999,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             self._clone_message_rows(conn, unseen)
             inserted += len(unseen)
             tool_calls_total += unseen_tool_calls
+        # The preserved in-place leading prefix remains active and counts toward the returned ACTIVE count.
+        inserted += kept
+        tool_calls_total += kept_tool_calls
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
         self._reconcile_display_orders(conn, session_id)
@@ -1079,6 +1095,14 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         steer_ids = {int(r["id"]) for r in conn.execute(
             "SELECT id FROM messages WHERE session_id = ? AND display_kind = 'steer' AND active = 1",
             (session_id,))}
+        # Preserve the in-order prefix of compacted_messages already present verbatim as the leading live
+        # rows (the no-op / "method:none" case, messages N -> N): stamp each with its existing _row_id and
+        # message_uid, and keep them active in place instead of archiving and re-inserting them (#82956).
+        live = conn.execute(_LIVE_IDENTITY_SQL, (session_id, len(compacted_messages) + 1)).fetchall()
+        kept = self._stamp_kept_live_prefix(live, compacted_messages)
+        kept_ids = [int(row[0]) for row in live[:kept]]
+        kept_set = set(kept_ids)
+        kept_tool_calls = sum(_tool_calls_len(row[4], scalar=1) for row in live[:kept])
         tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
             conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
             (session_id, int(watermark)))
@@ -1086,7 +1110,13 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # tail clone set so a concurrent steer is not duplicated or rewound. (Must run AFTER the
         # tail_ids assignment above — it previously ran before it and raised UnboundLocalError,
         # aborting every in-place compaction commit via the watermark/fallback path, #21301.)
-        tail_ids = [t for t in tail_ids if t not in steer_ids]
+        tail_ids = [t for t in tail_ids if t not in steer_ids and t not in kept_set]
+        if tail_ids:
+            _, tail_tool_calls = self._tail_rows_after_watermark(
+                conn, f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id",
+                tuple(tail_ids))
+        else:
+            tail_tool_calls = 0
         # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
         # concurrent append would steal a LIMIT slot.
         rewind_ids: list[int] = self._resolve_carried_row_ids(
@@ -1100,13 +1130,18 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                  int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
         rewind_ids += tail_ids
         rewind_ids = list(dict.fromkeys(rewind_ids))
-        rewind_ids = [rid for rid in rewind_ids if rid not in steer_ids]
+        rewind_ids = [rid for rid in rewind_ids if rid not in steer_ids and rid not in kept_set]
 
         if rewind_ids:
             placeholders = _placeholders(rewind_ids)
             conn.execute("UPDATE messages SET active = 0, compacted = 0 "
                 f"WHERE session_id = ? AND id IN ({placeholders})", [session_id, *rewind_ids])
-            conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({placeholders})", [session_id, *rewind_ids])
+            skip_ids = list(dict.fromkeys(rewind_ids + kept_ids))
+            skip_ph = _placeholders(skip_ids)
+            conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({skip_ph})", [session_id, *skip_ids])
+        elif kept_ids:
+            _kept_ph = _placeholders(kept_ids)
+            conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({_kept_ph})", [session_id, *kept_ids])
         else:
             conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
         # A2: restore exempted steer rows (same id, active=1, compacted=0) after the archive sweep so
@@ -1127,7 +1162,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # UNIQUE(session_id, message_uid) constraint on the restored original.
         if compacted_messages:
             compacted_messages = [
-                m for m in compacted_messages
+                m for m in compacted_messages[kept:]
                 if not (isinstance(m, dict) and m.get("display_kind") == "steer")
             ]
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
@@ -1135,6 +1170,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             self._clone_message_rows(conn, tail_ids)
             inserted += len(tail_ids)
             tool_calls_total += tail_tool_calls
+        # The preserved in-place leading prefix remains active and counts toward the returned ACTIVE count.
+        inserted += kept
+        tool_calls_total += kept_tool_calls
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
         self._reconcile_display_orders(conn, session_id)
