@@ -29,7 +29,7 @@ from typing import Iterable
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
     "HERMES_CRON_SESSION|HERMES_DELEGATED_CHILD_CONTEXT|"
-    "HERMES_RPC_|HERMES_KERNEL_DIR)")
+    "HERMES_RPC_|HERMES_KERNEL_DIR|HERMES_SURFACE)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # mktemp template suffix + the shell variable holding the allocated temp path.
@@ -232,7 +232,9 @@ def _export_dump_excluding_session_vars(
         # leaked token in the snapshot would re-export into every later command
         # on the backend and outlive the private dir it protects.
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        # HERMES_SURFACE is the per-request client surface (Mercury's X-Hermes-Surface); re-injected
+        # every command, so it must not persist into the shared snapshot.
+        f"HERMES_UI_SESSION_ID HERMES_SURFACE{extra_unset} 2>/dev/null; "
         # Shell-option mirrors are read-only, so bash 3.2's ``declare -rx SHELLOPTS=…`` line fails
         # on ``source`` and an inherited errexit then ends every later command; options are not
         # environment the next command needs, so they stay out of the snapshot.

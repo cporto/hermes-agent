@@ -75,7 +75,9 @@ class TestSetMessageApiContent:
             assert transcript_rows(db, "s1")[0]["api_content"] is None
 
             # Archived by compaction: active = 0, so the row is off limits.
-            db.messages.compact("s1", [NewMessage.from_live({"role": "user", "content": "hello"})])
+            # The replacement must differ from the live row: a compaction that repeats the leading live
+            # rows verbatim keeps them in place (#82956), so it would not archive this row.
+            db.messages.compact("s1", [NewMessage.from_live({"role": "user", "content": "compacted summary"})])
             assert db.messages.set_message_api_content("s1", row_id, "hello", "x") is False
         finally:
             db.close()

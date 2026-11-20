@@ -2168,7 +2168,7 @@ class TestSmartSkipForOptedInInteractiveApi:
             mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
             # Blocking wait would hang the test; give the gateway path a resolved
             # approve so we can assert the human path RAN (and returned a verdict).
-            def _fake_await(session_key, notify_cb, data, surface):
+            def _fake_await(session_key, notify_cb, data, surface, **_kw):
                 if notify_cb is not None:
                     notify_cb(data)  # as the real _await_gateway_decision does
                 return {"choice": "once", "resolved": True}
@@ -2242,7 +2242,7 @@ class TestSmartSkipForOptedInInteractiveApi:
         saved = self._env()
         notified = []
         mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
-        def _fake_await(session_key, notify_cb, data, surface):
+        def _fake_await(session_key, notify_cb, data, surface, **_kw):
             if notify_cb is not None:
                 notify_cb(data)
             return {"choice": "once", "resolved": True}
