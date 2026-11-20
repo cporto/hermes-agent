@@ -324,7 +324,10 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
     assert usage["input_tokens"] == 0
     assert usage["output_tokens"] == 0
     assert usage["total_tokens"] == 0
-    assert "runtime" not in usage
+    # Served-runtime metadata is attached to every finished turn (2d67cd363b); a default
+    # send (no route/requested runtime) reports route_source=global.
+    assert usage["runtime"]["route_source"] == "global"
+    assert result["runtime"] == usage["runtime"]
     assert observed == {
         "task_id": "request-session",
         "context_session_id": "request-session",
@@ -368,7 +371,9 @@ async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypat
     )
 
     assert result["session_id"] == "request-session"
-    assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    assert {k: v for k, v in usage.items() if k != "runtime"} == {
+        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    assert usage["runtime"]["route_source"] == "global"  # attached to every turn (2d67cd363b)
     assert observed == {"registered": True, "task_id": "request-session"}
     assert "run_steer_test" not in adapter._active_run_agents
 
@@ -377,7 +382,8 @@ async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypat
 async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_finishes(
     adapter, session_db
 ):
-    """Disconnects must interrupt the live run without dropping its control refs early."""
+    """A client disconnect must NOT interrupt the run (d33515f11a/bcbccbc571/ed1570da31); the
+    run keeps its control refs so explicit POST /v1/runs/{id}/stop can still reach the agent."""
     session_id = session_db.create_session("disconnect-stream-session", "api_server")
     run_started = threading.Event()
     interrupt_called = threading.Event()
@@ -446,21 +452,29 @@ async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_
         assert run_started.is_set()
         run_id = next(iter(adapter._run_statuses))
 
-        for _ in range(40):
-            if interrupt_called.is_set():
-                break
-            await asyncio.sleep(0.05)
-
-        assert interrupt_called.is_set()
+        # The write error ends the handler, but the run itself carries on.
+        await asyncio.wait_for(handler_task, timeout=5)
+        assert not interrupt_called.is_set(), "a client disconnect must not interrupt the run"
+        assert adapter._run_statuses[run_id]["status"] == "running"
         assert run_id in adapter._active_run_agents
         # Not in _active_run_tasks: session-stream turns are counted via
         # _inflight_agent_runs; a task entry would double-count them in the
         # shutdown drain (active_agent_work_count).
         assert run_id not in adapter._active_run_tasks
-        assert not handler_task.done()
+
+        # Stopping is explicit: POST /v1/runs/{id}/stop reaches the still-registered agent.
+        stop_request = MagicMock()
+        stop_request.headers = {}
+        stop_request.match_info = {"run_id": run_id}
+        stop_response = await adapter._handle_stop_run(stop_request)
+        assert stop_response.status == 200
+        assert interrupt_called.is_set()
 
         allow_finish.set()
-        await handler_task
+        for _ in range(100):
+            if run_id not in adapter._active_run_agents:
+                break
+            await asyncio.sleep(0.05)
 
     assert run_id not in adapter._active_run_agents
 
@@ -1315,8 +1329,14 @@ async def test_session_stream_records_reply_text_for_post_disconnect_recovery(
         assert run_started.is_set()
         run_id = next(iter(adapter._run_statuses))
 
+        # The client is gone; a disconnect no longer interrupts, so the run finishes on its own
+        # once the agent returns. Let it, then wait for the terminal status.
         allow_finish.set()
-        await handler_task
+        await asyncio.wait_for(handler_task, timeout=5)
+        for _ in range(100):
+            if adapter._run_statuses[run_id]["status"] == "completed":
+                break
+            await asyncio.sleep(0.05)
 
     record = adapter._run_statuses[run_id]
     assert record["status"] == "completed"
