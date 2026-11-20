@@ -5110,6 +5110,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         shutdown drain) so a reconnecting device can catch up via /v1/runs/{id}/events.
         Explicit abort is POST /v1/runs/{id}/stop. ``keep_running=False`` keeps the
         original behavior (interrupt unless subagents/clarify are active, then drain)."""
+        if keep_running:
+            # Clean client disconnect: leave the run alone. This must come BEFORE the "no agent
+            # registered" check below: the session-authority path (run_api_turn) never registers its
+            # agent in _active_run_agents, so an absent agent does not mean "not started", and
+            # cancelling the run's stream task here ended the replayable stream early (the turn itself
+            # kept going and saved its reply, but a reconnecting device saw the stream just stop).
+            return
         agent = self._active_run_agents.get(run_id)
         if agent is None:
             if not task.done():
@@ -5117,8 +5124,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 with suppress(Exception):
                     await task
             return
-        if keep_running:
-            return  # leave the run to finish in the background
         # Mirror the inbound-path guard (run_busy.py): don't interrupt a turn that is still
         # driving active subagents just because the client's SSE stream dropped. The run is
         # tracked in _active_run_agents and keeps running in the background, so it does not

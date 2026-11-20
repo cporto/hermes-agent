@@ -235,3 +235,55 @@ async def test_real_client_disconnect_replay_gets_every_frame_and_terminal(adapt
     assert len([n for n in names if n == "assistant.delta"]) == 12
     assert names[-2:] == ["done", None] or (names[-1] is None and "run.completed" in names)
     assert stream.terminal
+
+
+# The deployed gateway runs turns through the session-authority path (run_api_turn), which does NOT
+# register the agent in ``_active_run_agents``. A clean disconnect must still leave the run's stream
+# task alone (it used to be cancelled because "no agent registered" looked like "not started").
+@pytest.mark.asyncio
+async def test_disconnect_with_no_registered_agent_keeps_the_run_stream_task(adapter, session_db):
+    session_id = session_db.create_session("authority-path", "api_server")
+
+    async def fake_run_agent(**kw):
+        cb = kw["stream_delta_callback"]
+        for i in range(12):
+            cb(f"w{i} ")
+            await asyncio.sleep(0.25)
+        return ({"final_response": "all done", "session_id": session_id},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    with patch.object(
+        adapter, "_get_existing_session_or_404", return_value=({"id": session_id}, None)
+    ), patch.object(
+        adapter, "_read_json_body", return_value=({"message": "go"}, None)
+    ), patch.object(adapter, "_run_agent", side_effect=fake_run_agent):
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            async with ClientSession(connector=TCPConnector(force_close=True)) as cs:
+                resp = await cs.post(
+                    server.make_url(f"/api/sessions/{session_id}/chat/stream"), json={"message": "go"}
+                )
+                seen = 0
+                async for line in resp.content:
+                    if line.startswith(b"event: assistant.delta"):
+                        seen += 1
+                    if seen >= 2:
+                        break
+                resp.close()
+            assert not adapter._active_run_agents  # the authority path never registers one
+            run_id = next(iter(adapter._run_streams))
+            stream = adapter._run_streams[run_id]
+            for _ in range(150):
+                await asyncio.sleep(0.1)
+                if stream.terminal:
+                    break
+            names = [(ev or {}).get("event") for _seq, ev in stream.backlog]
+            assert len([n for n in names if n == "assistant.delta"]) == 12, names
+            assert "assistant.completed" in names or "run.completed" in names, (
+                f"the run's stream task was cancelled on disconnect instead of running to completion: {names}"
+            )
+        finally:
+            await server.close()
