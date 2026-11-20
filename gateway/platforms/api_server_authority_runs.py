@@ -150,7 +150,6 @@ async def stop_session(adapter, authority, ref):
     handle = authority._handle(ref)
     if handle.execution_state == 'running':
         await authority.interrupt(actor, ref, handle.execution_generation)
-        return
     for row in list_session_admissions(authority.db, session_id=ref.session_id):
         if row['status'] == 'queued':
             await authority.cancel_queued(actor, ref, row['admission_id'])
