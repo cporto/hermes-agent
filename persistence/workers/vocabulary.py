@@ -35,6 +35,7 @@ WORKER_MESSAGE_FIELDS = frozenset({
     "codex_reasoning_items", "codex_message_items", "platform_message_id", "message_id",
     "observed", "effect_disposition", "_compressed_summary", "timestamp", "api_content",
     "display_kind", "display_metadata", "_row_id", "_canonical_content", "_db_row_snapshot", "_canonical_row", "data_use",
+    "attachments",  # carried: a user turn's image refs (persisted by the carried attachments column)
 }) | _PERSISTENCE_ONLY_FIELDS | {"_absorbed_row_ids"}
 
 #: Compaction and publication handoff rows also carry the summary's user-turn flag.
