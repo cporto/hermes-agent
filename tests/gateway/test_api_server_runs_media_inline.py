@@ -71,7 +71,7 @@ def test_run_projection_inlines_media(monkeypatch, tmp_path):
         pass
 
     class _Auth:
-        db = _DB()
+        persistence = _DB()
         sessions = {}
 
     row = {"status": "terminal", "outcome": "completed", "admission_id": "a1",

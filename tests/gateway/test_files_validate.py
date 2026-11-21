@@ -71,6 +71,7 @@ def seeded(monkeypatch, tmp_path):
 async def _validate(client, paths):
     resp = await client.post(
         "/v1/files/validate", json={"paths": paths}, headers=_auth())
+    await resp.read()  # buffer the body now: tests read it after the client context has closed
     return resp
 
 
@@ -192,6 +193,7 @@ async def test_validate_non_json_body_returns_400(seeded):
     async with TestClient(TestServer(_app(_adapter()))) as client:
         resp = await client.post(
             "/v1/files/validate", data=b"not json", headers=_auth())
+        await resp.read()  # buffer before the client context closes
     assert resp.status == 400
     assert (await resp.json()) == {"error": [{"code": "files_validate_invalid"}]}
 
@@ -244,10 +246,10 @@ def test_agree_and_never_echo_resolved_path(seeded):
         assert reason == expected
         # The stable code seen by a client equals the validator reason when it is a stable known
         # reason, else the collapsed "denied": never echo the resolved path, only the input.
-        stable = reason if reason in {
+        stable = None if reason is None else (reason if reason in {
             "not_found", "not_absolute", "traversal", "bad_path", "denied",
             "not_allowed", "not_a_file", "hardlink", "too_large",
-        } else "denied"
+        } else "denied")
         assert stable == expected
 
 

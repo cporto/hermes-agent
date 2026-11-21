@@ -22,6 +22,7 @@ from gateway.session_api_turn import (
 from gateway.session_ingress import execute_admission
 from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
+from tests.gateway.session_claims import claim
 
 
 CHECKPOINT = {
@@ -74,7 +75,7 @@ async def _admit(api, owner, session_id, message):
         execution_result.get()['result'] = {'final_response': 'ok'}
         return 'ok'
     owner.runner._handle_message = handle
-    await execute_admission(owner, ref, row)
+    await execute_admission(owner, ref, claim(owner, ref, row))
     route = owner.sessions[ref.session_id].route
     assert route is not None
     # The admission must register the route in the real SessionStore, else set/get are no-ops.
