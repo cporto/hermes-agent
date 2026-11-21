@@ -1803,10 +1803,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ('POST', '/api/sessions/{session_id}/rewind', self._handle_rewind_session),
             ('POST', '/api/sessions/{session_id}/approval', self._handle_session_approval),
             ('POST', '/api/sessions/{session_id}/clarify', self._handle_session_clarify),
-            ('GET', '/api/sessions/{session_id}/pending-controls', self._handle_session_pending_controls),
             ('POST', '/api/sessions/{session_id}/chat', self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
-            ("GET", "/api/sessions/{session_id}/active-run", self._handle_session_active_run),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
@@ -4033,76 +4031,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
-
-    @_require_auth
-    async def _handle_session_pending_controls(self, request: web.Request) -> web.Response:
-        """GET /api/sessions/{session_id}/pending-controls — read the pending interactive
-        controls (clarify) for a session, so a re-opened/refreshed client can re-render a
-        ClarifyCard whose live SSE event it missed. Read-only projection from
-        tools.clarify_gateway; the returned ``clarify_id`` is the key the client POSTs to
-        /api/sessions/{id}/clarify to answer it (fail-closed 409 on a stale/answered id)."""
-        session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        from tools import clarify_gateway as _cmod
-        gateway_key, _ = self._parse_session_key_header(request)
-        entry = None
-        # Resolve across every key that addresses this session: bare id, the gateway
-        # session key, and any ``:dm:`` variant registered in the index (a peer/dm turn
-        # may have indexed its pending clarify under ``<key>:dm:<id>``). A re-opened
-        # client must see the live prompt whichever key it was filed under.
-        resolve_keys = _cmod.find_session_keys_for_session_id(session_id)
-        for key in list(resolve_keys) + [gateway_key, session_id]:
-            if not key:
-                continue
-            entry = _cmod.get_pending_for_session(key, include_choice_prompts=True)
-            if entry is not None:
-                break
-        controls = []
-        if entry is not None:
-            controls.append({
-                "kind": "clarify",
-                "clarify_id": entry.clarify_id,
-                "question": entry.question,
-                "choices": entry.choices,
-                "multi_select": entry.multi_select,
-            })
-        return web.json_response({"session_id": session_id, "pending_controls": controls})
-
-    @_require_auth
-    async def _handle_session_active_run(self, request: web.Request) -> web.Response:
-        """GET /api/sessions/{session_id}/active-run — discover the newest non-terminal run
-        bridged from a session chat stream into the shared run channel (Mercury P3 Slice 2).
-        Returns ``{'active': true, 'run_id', 'status', 'last_seq'}`` so a re-opened client can
-        subscribe to GET /v1/runs/{id}/events from ``last_seq``; ``{'active': false}`` when no
-        live run matches the session."""
-        session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
-        if err:
-            return err
-        from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
-        best = None  # (created_at, status, run_id)
-        for run_id, status in self._run_statuses.items():
-            if status.get("session_id") != session_id:
-                continue
-            if status.get("status") in TERMINAL_STATUSES:
-                continue
-            created = status.get("created_at") or 0.0
-            if best is None or created > best[0]:
-                best = (created, status.get("status") or "queued", run_id)
-        if best is None:
-            return web.json_response({"active": False, "session_id": session_id})
-        _, run_status, run_id = best
-        stream = self._run_streams.get(run_id)
-        last_seq = (stream.next_seq - 1) if stream is not None else 0
-        return web.json_response({
-            "active": True,
-            "session_id": session_id,
-            "run_id": run_id,
-            "status": run_status,
-            "last_seq": max(0, last_seq),
-        })
 
     @_require_auth
     async def _handle_session_model_lock(self, request: web.Request) -> web.Response:
