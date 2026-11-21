@@ -356,24 +356,31 @@ class InterruptControlMixin:
             _sid = getattr(self, "session_id", None)
             if not _sid:
                 return
+            from agent.agent_init_session import agent_interface
             from agent.prompt_builder import steer_user_row
-            from agent.session_persistence import _persist_lock, _db_flush_row
+            from agent.session_persistence import _persist_lock, _db_flush_row, _new_message
+            from persistence.conversation.messages import TranscriptRead
+            store = agent_interface(self)
+            if store is None:
+                return
             with _persist_lock(self):
-                _existing = _db._read_one(
-                    "SELECT id FROM messages WHERE session_id = ? AND display_kind = 'steer' "
-                    "AND message_uid = ? AND active = 1",
-                    (_sid, _uid))
+                # The storage interface has no raw-SQL read: find this steer's live row by uid in the
+                # session's active transcript (same predicate the old SELECT used: display_kind='steer',
+                # message_uid=<uid>, active).
+                _existing = next(
+                    (r for r in store.messages.read_transcript(_sid, TranscriptRead())
+                     if r.display_kind == "steer" and r.message_uid == _uid),
+                    None)
                 _row = steer_user_row(_text)
                 _row["message_uid"] = _uid
                 if _existing is not None:
                     # Same logical steer already durable: update its content to the full concatenated
                     # text (a second /steer extended _pending_steer). role='user' via set_user_message_content.
-                    _db.set_user_message_content(_sid, int(_existing["id"]), _row["content"])
+                    store.messages.set_user_message_content(_sid, _existing.id, _row["content"])
                 else:
-                    _db.append_messages_batch(
-                        session_id=_sid,
-                        messages=[_db_flush_row(self, _row, is_current_turn_user=False)],
-                        compression_lock_holder=getattr(self, "_active_compression_lock_holder", None),
+                    store.messages.append_batch(
+                        _sid,
+                        [_new_message(_db_flush_row(self, _row, is_current_turn_user=False))],
                         turn_lease_holder=getattr(self, "_active_session_turn_lease_holder", None),
                         turn_lease_ttl_seconds=getattr(self, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
                     )
