@@ -2763,7 +2763,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _files_route_prelude(self, request: web.Request, action: str) -> tuple:
         """Shared /v1/files gate (API key required -> Bearer -> per-profile sliding-window rate limit) ->
-        ``((profile, profile), None)`` or ``(None, error_response)``. Re-ported from the removed artifact prelude."""
+        ``((profile, profile), None)`` or ``(None, error_response)``. Our own carried gate (upstream has no
+        file-transfer API). Must stay a plain SYNC method: callers use it without ``await``, so decorating
+        it with ``@_require_auth`` (which makes it a coroutine function) breaks every /v1/files route."""
         if not self._api_key:
             return None, _error_response(
                 "File transport requires a configured API key.", 403,
