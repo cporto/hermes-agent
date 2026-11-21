@@ -202,7 +202,9 @@ def _session_row(session, entry=None) -> dict[str, Any]:
         "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason", "message_count",
         "tool_call_count", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd", "api_call_count", "parent_session_id", "pinned",
-        "archived", "hidden", "complete", "context_usage", "system_prompt")} | {"id": session.session_id, "model_config": dict(session.model_config)}
+        "archived", "hidden", "system_prompt")} | {"id": session.session_id, "model_config": dict(session.model_config)}
+    # Carried fields (complete flag, compressor threshold usage): a record without them reads as unset.
+    row.update({key: getattr(session, key, None) for key in ("complete", "context_usage")})
     if entry is not None:
         row.update(last_active=entry.last_active, preview=entry.preview)
         row.update({"_lineage_root_id": entry.lineage_root_id} if entry.lineage_root_id is not None else {})
@@ -5651,12 +5653,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # up to ~60s after a restart.
                 deadline = time.monotonic() + _BIND_DEADLINE_SECONDS
                 attempt = 0
+                self._site = None
+                last_busy: Optional[OSError] = None
                 while time.monotonic() < deadline:
                     attempt += 1
                     try:
                         self._site = await start_tcp_site(self._runner, self._host, self._port, log_tag=self.name)
                         break
                     except OSError as exc:
+                        last_busy = exc
                         if exc.errno != errno.EADDRINUSE:
                             # Any non-port-conflict bind error (EACCES, EADDRNOTAVAIL, EINVAL, ...) is a
                             # permanent misconfiguration — raise immediately, never retry.
@@ -5669,6 +5674,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         self._runner = web.AppRunner(self._app)
                         await self._runner.setup()
                         await asyncio.sleep(0.2 * attempt)
+                if self._site is None:
+                    # The last retry's backoff crossed the deadline: the loop ended without a bound site.
+                    # Never fall through as if bound (connect() would report a listener that does not exist).
+                    raise last_busy if last_busy is not None else OSError(errno.EADDRINUSE, "bind deadline elapsed")
             except OSError as exc:
                 await self._runner.cleanup()
                 self._runner = None
