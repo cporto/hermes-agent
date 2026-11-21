@@ -152,7 +152,9 @@ def test_create_agent_without_room_dispatch_keeps_operator_toolsets(monkeypatch)
     with patch("run_agent.AIAgent") as agent_cls:
         adapter._create_agent(room_execution_policy=_forged_policy())
     kwargs = agent_cls.call_args.kwargs
-    assert kwargs["enabled_toolsets"] == ["web"]
+    # Operator toolsets are untouched by the stray policy; the api_server surface adds its own
+    # `clarify` tool for Mercury's ClarifyCard bridge (carried, 17425eb582), so it is always present.
+    assert kwargs["enabled_toolsets"] == ["clarify", "web"]
     assert kwargs["max_iterations"] == 7
 
 
