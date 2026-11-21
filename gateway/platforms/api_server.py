@@ -2761,7 +2761,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 if len(entry) < 3 or features[entry[2]]},
         })
 
-    @_require_auth
     def _files_route_prelude(self, request: web.Request, action: str) -> tuple:
         """Shared /v1/files gate (API key required -> Bearer -> per-profile sliding-window rate limit) ->
         ``((profile, profile), None)`` or ``(None, error_response)``. Re-ported from the removed artifact prelude."""
