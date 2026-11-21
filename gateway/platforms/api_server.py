@@ -8,7 +8,6 @@ OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_
 
 import asyncio
 import errno
-import fnmatch
 import hashlib
 import itertools
 import json
@@ -19,9 +18,7 @@ import logging
 import os
 import re
 import sqlite3
-import stat
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -56,25 +53,6 @@ _api_request_surface: ContextVar[str] = ContextVar("api_server_request_surface",
 # system prompt: machine role token only — never prose, spaces, or newlines. Mirrors the
 # session_api_turn._valid_surface re-validation (defense-in-depth).
 _SURFACE_ALLOW_RE = re.compile(r"^[a-z0-9|_-]{0,64}$")
-
-
-class _FilesRateLimiter:
-    """Sliding-window per-key limiter for the /v1/files routes."""
-    def __init__(self, *, window_seconds: float = 60.0, max_requests: int = 30) -> None:
-        self._window = max(1.0, float(window_seconds)); self._max = max(1, int(max_requests))
-        self._lock = threading.Lock(); self._hits: dict[str, list[float]] = {}
-
-    def allow(self, key: str) -> bool:
-        if not isinstance(key, str) or not key:
-            return False
-        now = time.time()
-        with self._lock:
-            hits = [h for h in self._hits.get(key, []) if h > now - self._window]
-            ok = len(hits) < self._max
-            if ok:
-                hits.append(now)
-            self._hits[key] = hits
-            return ok
 
 
 def _sanitize_surface_header(raw) -> str:
@@ -170,12 +148,6 @@ from agent.i18n import t
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
-# Single source of the file-serving allowlist rules (roots, deny-list, validator); re-exported so
-# the streaming GET /v1/files download and the batch POST /v1/files/validate oracle share one copy.
-from gateway.files_allowlist import (
-    _files_roots, _files_deny_dirs, _FILES_DENY_SEGMENTS, _FILES_DENY_NAMES, _FILES_MAX_BYTES,
-    _validate_allowlist_path)
-
 from gateway.parked_route_refusal import ParkedRouteRefused
 from gateway.platforms._shared import coerce_port as _coerce_port, get_scoped_secret as _get_scoped_secret
 from gateway.platforms._shared import secrets_match
@@ -190,10 +162,6 @@ _agent_has_active_subagents = _BusySessionMixin._agent_has_active_subagents
 
 
 logger = logging.getLogger(__name__)
-
-# Monotonic source for the A1 WidgetState `rev` field (an integer). The exact value is not
-# contractual — only that it increases across refreshes so clients can order changes.
-_WIDGETS_REV_COUNTER = itertools.count(1)
 
 
 def _session_row(session, entry=None) -> dict[str, Any]:
@@ -980,108 +948,6 @@ def _error_response(
 def _invalid_request(message: str) -> web.Response:
     """400 with the bare ``{message, type}`` envelope the OpenAI-compatible validators use."""
     return web.json_response({"error": {"message": message, "type": "invalid_request_error"}}, status=400)
-
-
-# ---------------------------------------------------------------------------
-# GET /v1/files — path-based, allowlist-rooted file download.
-#
-# The allowlist roots, deny-list, and the pure path validator now live in
-# :mod:`gateway.files_allowlist` (imported above) as the SINGLE source of truth, shared
-# with the batch POST /v1/files/validate oracle. This handler keeps its own streaming +
-# the opened-fd TOCTOU checks (regular file, st_nlink == 1, size cap, inode identity);
-# the moved primitives are pure validation only. Errors never echo the resolved path.
-
-
-def _files_deny_response(reason: str) -> web.Response:
-    """Map a validator deny reason to a safe, generic HTTP response (resolved path is never echoed)."""
-    status = {
-        "not_found": 404,
-        "missing_path": 400,
-        "not_absolute": 400,
-        "traversal": 400,
-        "bad_path": 400,
-        "backslash": 400,
-        "too_large": 413,
-        "not_a_file": 403,
-        "denied": 403,
-        "not_allowed": 403,
-        "hardlink": 403,
-        "read_error": 403,
-    }.get(reason, 403)
-    return _error_response("Requested file is not available.", status, code="files_denied")
-
-
-# Stable deny reason codes surfaced by the batch validate oracle. Anything not listed here
-# (missing_path, backslash, read_error, ...) is collapsed to "denied" so the client only ever
-# sees a known, generic classification. The resolved/canonical path is never returned.
-_VALIDATE_STABLE_REASONS = frozenset({
-    "not_found", "not_absolute", "traversal", "bad_path", "denied",
-    "not_allowed", "not_a_file", "hardlink", "too_large",
-})
-
-
-def _validate_reason_code(reason: str) -> str:
-    """Map a validator deny reason to a stable generic code (all unknown reasons -> "denied")."""
-    return reason if reason in _VALIDATE_STABLE_REASONS else "denied"
-
-
-# ---------------------------------------------------------------------------
-# POST /v1/files — bounded raw upload into a dedicated private upload root.
-#
-# Shares the download route's allowlist/deny primitives (single source of truth)
-# so an uploaded name is ALWAYS servable by GET /v1/files without a dead 403 card.
-# The client filename is DISPLAY metadata only — never a path component. The
-# on-disk name is server-minted `<hexid>_<safe_name>`; the safe_name is a
-# sanitized slug whose extension survives only if it is not deny-listed and not
-# an active (scriptable) type, otherwise the file is stored as `.bin`.
-_FILES_UPLOAD_MAX_BYTES = 10 * 1024 * 1024                 # inherit the global 10 MB body cap
-_FILES_UPLOAD_ROOT_TOTAL_BYTES = 4 * 1024 * 1024 * 1024    # 4 GB whole-root cap (disk-fill bound)
-_FILES_UPLOAD_TTL_SECONDS = 7 * 24 * 3600                  # reaper: purge uploads older than 7 days
-
-# Extension types treated as active/scriptable content -> always stored as `.bin`.
-_FILES_ACTIVE_EXTS = frozenset({
-    "html", "htm", "xhtml", "xht", "svg", "xml",
-    "js", "mjs", "cjs", "wasm", "exe", "dll", "com",
-    "sh", "bat", "cmd", "ps1", "vbs",
-})
-
-
-class _FilesUploadError(Exception):
-    def __init__(self, status: int, code: str):
-        super().__init__(code)
-        self.status = status
-        self.code = code
-
-
-def _files_upload_root() -> str:
-    """Dedicated, private upload root. Sits under the already-allowed `~/.hermes` download
-    root (so GET /v1/files serves it) but is a dedicated 0700 directory, not a shared one."""
-    return os.path.realpath(os.path.join(os.path.expanduser("~"), ".hermes", "uploads"))
-
-
-def _sanitize_upload_base(filename: str) -> str:
-    """Reduce a client display filename to a safe on-disk slug. No path separators, no control
-    bytes, bounded length, safe extension only; deny-listed or active names/exts -> `.bin`.
-    The caller prepends a server-minted id, so this is just the collision-safe slug."""
-    name = os.path.basename((filename or "").replace("\\", "/")).strip()
-    if not name:
-        return "file"
-    # Deny check on the raw-ish name BEFORE dot-stripping so ".env" is still caught.
-    pre = re.sub(r"[^A-Za-z0-9._\-]", "_", name)[:100]
-    if any(fnmatch.fnmatch(pre, pat) for pat in _FILES_DENY_NAMES):
-        stem = pre.split(".")[0].strip("._") or "file"
-        return f"{stem}.bin"
-    name = pre.strip("._")
-    if not name:
-        return "file"
-    stem, dot, ext = name.rpartition(".")
-    if not dot:
-        stem, ext = name, ""
-    stem_ok = stem or "file"
-    ext_l = ext.lower()
-    if dot and (ext_l in _FILES_ACTIVE_EXTS or not re.fullmatch(r"[a-z0-9]{1,10}", ext_l)):
-        return f"{stem_ok}.bin"
-    return name
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -1925,11 +1791,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
-            ("GET", "/v1/files", self._handle_files_download),
-            ("POST", "/v1/files", self._handle_files_upload),
-            ("POST", "/v1/files/validate", self._handle_files_validate),
-            ("GET", "/v1/widgets", self._handle_widgets),
-            ("GET", "/v1/widgets/{widget_id}", self._handle_widget),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -1962,13 +1823,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
-        # Mercury saved-prompts — per-user durable store (survives client cache clears).
-        # Auth via the API key (mutable endpoint). Storage is intentionally a single
-        # global <hermes_home>/mercury_saved_prompts.json for the default single-user
-        # profile; on a multiplexed gateway the handler resolves the profile home via
-        # the existing contextvar, so this stays per-profile without extra scoping.
-        routes.append(("GET", "/v1/mercury/saved-prompts", self._handle_saved_prompts_get))
-        routes.append(("PUT", "/v1/mercury/saved-prompts", self._handle_saved_prompts_put))
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
@@ -2763,235 +2617,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 if len(entry) < 3 or features[entry[2]]},
         })
 
-    def _files_route_prelude(self, request: web.Request, action: str) -> tuple:
-        """Shared /v1/files gate (API key required -> Bearer -> per-profile sliding-window rate limit) ->
-        ``((profile, profile), None)`` or ``(None, error_response)``. Our own carried gate (upstream has no
-        file-transfer API). Must stay a plain SYNC method: callers use it without ``await``, so decorating
-        it with ``@_require_auth`` (which makes it a coroutine function) breaks every /v1/files route."""
-        if not self._api_key:
-            return None, _error_response(
-                "File transport requires a configured API key.", 403,
-                err_type="gateway_auth_error", code="files_auth_required")
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return None, auth_err
-        profile = _api_request_profile.get() or "default"
-        limiter = getattr(self, "_files_limiter", None)
-        if limiter is None:
-            limiter = self._files_limiter = _FilesRateLimiter(window_seconds=60.0, max_requests=30)
-        if not limiter.allow(f"{action}:{profile}"):
-            return None, _error_response(
-                f"File {action} rate limit exceeded.", 429, err_type="rate_limit_error",
-                code="rate_limit_exceeded", headers={"Retry-After": "1"})
-        return (profile, profile), None
-
-    async def _handle_files_download(self, request: web.Request) -> web.StreamResponse:
-        """GET /v1/files?path=<allowlist-rooted absolute path> — repeatable path-based download.
-
-        Re-reads the file on every request (live-read semantics). Ladder: 403 no API key,
-        401 bad Bearer, 429 rate limited, 400 bad path / traversal, 404 not found, 403 not
-        allowed / not a regular file, 413 too large, 200 attachment stream. Serves only
-        regular, non-hardlink files under an allowlist root and off the deny-list; always
-        ``Content-Disposition: attachment`` + ``nosniff``; never echoes the resolved path.
-        """
-        _ctx, err = self._files_route_prelude(request, "files")
-        if err is not None:
-            return err
-        # Reject URL-encoded traversal tokens on the RAW query string — reject raw, never
-        # "decode then hope".
-        if re.search(r"%2e|%2f|%5c", request.query_string, flags=re.IGNORECASE):
-            return _error_response("Invalid path.", 400, code="files_bad_path")
-        paths = request.query.getall("path", [])
-        if len(paths) != 1 or not paths[0].strip():
-            return _error_response("A single 'path' query parameter is required.", 400, code="files_bad_path")
-        canonical, reason = _validate_allowlist_path(paths[0].strip())
-        if canonical is None:
-            return _files_deny_response(reason)
-        # Open with O_NOFOLLOW on the final component, then validate the *opened* fd
-        # (regular file, st_nlink == 1, size cap, inode == canonical) — closes the
-        # check-then-open TOCTOU window (no openat2 on the runtime Python).
-        try:
-            fd = os.open(canonical, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except FileNotFoundError:
-            return _error_response("File not found.", 404, code="files_not_found")
-        except OSError:
-            return _error_response("File not available.", 403, code="files_denied")
-        try:
-            st = os.fstat(fd)
-            ok = stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_size <= _FILES_MAX_BYTES
-            if ok:
-                head = os.stat(canonical)
-                ok = (st.st_dev, st.st_ino) == (head.st_dev, head.st_ino)
-        except OSError:
-            ok = False
-        if not ok:
-            os.close(fd)
-            return _files_deny_response("denied")
-        safe_name = os.path.basename(canonical).replace('"', "_")[:128]
-        resp = web.StreamResponse(status=200, headers={
-            "Content-Type": "application/octet-stream",
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
-            "X-Content-Type-Options": "nosniff",
-        })
-        resp.content_length = st.st_size
-        await resp.prepare(request)
-        try:
-            while True:
-                chunk = os.read(fd, 64 * 1024)
-                if not chunk:
-                    break
-                await resp.write(chunk)
-        finally:
-            os.close(fd)
-        return resp
-
-    async def _handle_files_validate(self, request: web.Request) -> web.Response:
-        """POST /v1/files/validate — batch confirmation oracle mirroring GET /v1/files.
-
-        For each raw path string it runs the SAME shared allowlist validator
-        (:mod:`gateway.files_allowlist`) the download stream uses, so "validate says ok" and
-        "download returns 200" can never drift. It stats only (never opens/reads/streams the
-        body) and never echoes the resolved canonical path — only the client's input string and,
-        for OK results, the basename + size. Returns 200 always with ``{"results":[...]}`` in
-        input order, one result per input even on error.
-        """
-        _ctx, err = self._files_route_prelude(request, "files")
-        if err is not None:
-            return err
-        try:
-            data = await request.read()
-            payload = json.loads(data.decode("utf-8")) if data else None
-        except Exception:
-            payload = None
-        invalid = web.json_response({"error": [{"code": "files_validate_invalid"}]}, status=400)
-        if not isinstance(payload, dict) or not isinstance(payload.get("paths"), list):
-            return invalid
-        paths = payload["paths"]
-        if not paths or len(paths) > 64:
-            return invalid
-        results = []
-        for raw in paths:
-            if not isinstance(raw, str):
-                # Non-string input is not a valid path to serve; never echo a resolved path.
-                results.append({"path": raw, "ok": False, "reason": "denied"})
-                continue
-            canonical, reason = _validate_allowlist_path(raw)
-            if canonical is None:
-                results.append({"path": raw, "ok": False, "reason": _validate_reason_code(reason)})
-                continue
-            try:
-                size = os.stat(canonical).st_size
-            except OSError:
-                results.append({"path": raw, "ok": False, "reason": "denied"})
-                continue
-            results.append({
-                "path": raw,
-                "ok": True,
-                "name": os.path.basename(canonical),
-                "size": size,
-            })
-        return web.json_response({"results": results}, status=200)
-
-    @_require_auth
-    async def _handle_files_upload(self, request: web.Request) -> web.Response:
-        """POST /v1/files — bounded raw upload into the dedicated ``~/.hermes/uploads`` root.
-
-        Reuses the download validator's allowlist/deny primitives so the returned absolute
-        path is always servable by GET /v1/files (never a dead 403 card). The client filename
-        (``X-File-Filename``) is display metadata only; the on-disk name is server-minted
-        ``<hexid>_<safe>``. Ladder: 403 no API key, 401 bad Bearer, 429 rate limited,
-        413 size cap, 507 quota, 400 bad request, 201 {path, name, size, mime}.
-        """
-        _ctx, err = self._files_route_prelude(request, "upload_f")
-        if err is not None:
-            return err
-        raw_filename = request.headers.get("X-File-Filename", "").strip()
-        # Mercury URL-encodes the client filename (encodeURIComponent) because a
-        # raw non-ASCII char (e.g. an em-dash) cannot live in an HTTP header - the
-        # browser throws a TypeError before any bytes are sent. Decode it back
-        # before slugging; fall back to raw on any malformed/missing value.
-        import urllib.parse
-        try:
-            filename = urllib.parse.unquote(raw_filename)
-        except Exception:
-            filename = raw_filename
-        content_type = request.headers.get("Content-Type", "") or "application/octet-stream"
-        safe_name = _sanitize_upload_base(filename)
-        try:
-            # await request.read() reads the ENTIRE body (blocks until EOF) and honors the
-            # app's client_max_size (= MAX_REQUEST_BYTES, 10 MB): it both waits for the full
-            # payload and raises web.HTTPRequestEntityTooLarge above the cap. A single
-            # request.content.read(n) returns a short read on this aiohttp runtime, which was
-            # silently truncating uploads (client got it, file written short). This is the fix.
-            data = await request.read()
-        except web.HTTPRequestEntityTooLarge:
-            return _error_response("File exceeds the 10 MB upload cap.", 413, code="files_too_large")
-        except Exception:
-            return _error_response("Failed to read request body.", 400)
-        if len(data) > _FILES_UPLOAD_MAX_BYTES:
-            return _error_response("File exceeds the 10 MB upload cap.", 413, code="files_too_large")
-        if not data:
-            return _error_response("Empty request body.", 400)
-        uid = hashlib.sha256(data).hexdigest()[:16] + os.urandom(3).hex()
-        on_disk = f"{uid}_{safe_name}"
-
-        def _write() -> str:
-            root = _files_upload_root()
-            try:
-                os.makedirs(root, mode=0o700, exist_ok=True)
-            except OSError:
-                pass
-            # Whole-root quota + TTL reaper (bounds disk fill; per-principal quota is Phase-2).
-            now = time.time()
-            total = 0
-            try:
-                for entry in os.scandir(root):
-                    if entry.is_file(follow_symlinks=False):
-                        try:
-                            st = entry.stat()
-                            total += st.st_size
-                            if now - st.st_mtime > _FILES_UPLOAD_TTL_SECONDS:
-                                os.unlink(entry.path)
-                        except OSError:
-                            pass
-            except OSError:
-                pass
-            if total + len(data) > _FILES_UPLOAD_ROOT_TOTAL_BYTES:
-                raise _FilesUploadError(507, "files_quota")
-            full = os.path.join(root, on_disk)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                fd = os.open(full, flags, 0o600)
-            except FileExistsError:
-                raise _FilesUploadError(500, "files_write") from None
-            except OSError as exc:
-                raise _FilesUploadError(507, "files_write") from exc
-            try:
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(data)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                st = os.stat(full)
-                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-                    os.unlink(full)
-                    raise _FilesUploadError(500, "files_write")
-            except OSError as exc:
-                with suppress(OSError):
-                    os.unlink(full)
-                raise _FilesUploadError(500, "files_write") from exc
-            return full
-
-        try:
-            full = await asyncio.to_thread(_write)
-        except _FilesUploadError as exc:
-            return _error_response("Upload failed.", exc.status, code=exc.code)
-        return web.json_response({
-            "path": full,
-            "name": safe_name,
-            "size": len(data),
-            "mime": content_type,
-        }, status=201)
-
     @_require_auth
     async def _handle_skills(self, request: web.Request) -> web.Response:
         """GET /v1/skills — deterministic JSON listing of installed skills (name, description,
@@ -3005,286 +2630,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("GET /v1/skills failed")
             return _error_response("Failed to enumerate skills", 500, err_type="server_error")
         return web.json_response({"object": "list", "data": skills})
-
-    # -- Mercury saved-prompts (per-user durable store) --------------------------------
-    # Saved composer prompts normally live in client localStorage, so a cache/site-data
-    # clear wipes them. Keep them server-side in <hermes_home>/mercury_saved_prompts.json
-    # on the single-user gateway so they survive any client storage clear. Both endpoints
-    # require the API key (mutable + exposes user data). JSON shape: {"prompts": [str,...]}.
-    _SAVED_PROMPT_MAX_LEN = 16_384  # per-prompt char cap (write AND read), anti-abuse.
-
-    def _saved_prompts_path(self) -> Path:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home()) / "mercury_saved_prompts.json"
-
-    def _read_saved_prompts(self) -> list:
-        try:
-            p = self._saved_prompts_path()
-            if not p.exists():
-                return []
-            raw = json.loads(p.read_text("utf-8"))
-            arr = raw.get("prompts", raw) if isinstance(raw, dict) else raw
-            if not isinstance(arr, list):
-                return []
-            return [x for x in arr if isinstance(x, str) and len(x) <= self._SAVED_PROMPT_MAX_LEN]
-        except Exception:
-            logger.exception("read saved-prompts failed")
-            return []
-
-    def _atomic_write_saved_prompts(self, path: Path, prompts: list) -> None:
-        """Atomic + durable write: unique temp file in the same dir, fsync, then
-        os.replace. On any failure the temp file is removed; never leaves a torn file."""
-        os.makedirs(path.parent, mode=0o700, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"prompts": prompts}, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_name, path)
-        except Exception:
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            raise
-
-    @_require_auth
-    async def _handle_saved_prompts_get(self, request: web.Request) -> web.Response:
-        """GET /v1/mercury/saved-prompts — the user's saved prompts (auth required)."""
-        return web.json_response({"prompts": self._read_saved_prompts()})
-
-    @_require_auth
-    async def _handle_saved_prompts_put(self, request: web.Request) -> web.Response:
-        """PUT /v1/mercury/saved-prompts — replace the user's saved prompts (auth required).
-        Body: {\"prompts\": [str, ...]}; bounded list size AND per-item length; atomic write."""
-        try:
-            body = await request.json()
-        except Exception:
-            return _error_response("Expected a JSON body: {\"prompts\": [...]}", 400)
-        prompts = body.get("prompts") if isinstance(body, dict) else None
-        if not isinstance(prompts, list) or not all(isinstance(x, str) for x in prompts):
-            return _error_response("'prompts' must be a JSON array of strings", 400)
-        if any(len(x) > self._SAVED_PROMPT_MAX_LEN for x in prompts):
-            return _error_response(
-                f"'prompts' entries must be <= {self._SAVED_PROMPT_MAX_LEN} chars", 400
-            )
-        prompts = prompts[:500]
-        try:
-            self._atomic_write_saved_prompts(self._saved_prompts_path(), prompts)
-        except Exception:
-            logger.exception("PUT /v1/mercury/saved-prompts persist failed")
-            return _error_response("Failed to persist saved prompts", 500)
-        return web.json_response({"ok": True, "count": len(prompts)})
-
-    def _widgets_enabled(self) -> bool:
-        """A1 widget-publisher feature flag — additive + reversible. Defaults ON so the route
-        works out of the box for the live server; tests monkeypatch this to turn it off (an
-        off flag makes /v1/widgets return [] and /v1/widgets/{id} 404, never a break)."""
-        return True
-
-    @_require_auth
-    async def _handle_widgets(self, request: web.Request) -> web.Response:
-        """GET /v1/widgets — the current status + activity widgets as a plain JSON ARRAY (the
-        Mercury listWidgets client expects an array body, not {"data": [...]})."""
-        if not self._widgets_enabled():
-            return web.json_response([])
-        return web.json_response(self._build_aggregate_widgets())
-
-    @_require_auth
-    async def _handle_widget(self, request: web.Request) -> web.Response:
-        """GET /v1/widgets/{widget_id} — narrow refresh of a single widget ("status" |
-        "activity"), same shape as the batch. Unknown (or disabled) ids 404."""
-        widget_id = request.match_info.get("widget_id", "")
-        if not self._widgets_enabled():
-            return _error_response(f"Unknown widget: {widget_id}", 404, code="widget_not_found")
-        widgets = {w["id"]: w for w in self._build_aggregate_widgets()}
-        widget = widgets.get(widget_id)
-        if widget is None:
-            return _error_response(f"Unknown widget: {widget_id}", 404, code="widget_not_found")
-        return web.json_response(widget)
-
-    def _build_aggregate_widgets(self) -> list[dict[str, Any]]:
-        """Project existing gateway-owned state into the two A1 WidgetState widgets. Both share
-        the envelope {id, kind, schemaVersion, updatedAt(epoch-ms), rev, state}. Every data
-        lookup is defensive: a hiccup degrades to a minimal idle status widget rather than
-        failing the whole list (auth is handled separately by the decorator)."""
-        updated_at_ms = int(time.time() * 1000)
-        status_state: dict[str, Any] = {"phase": "idle"}
-        active_runs = 0
-        busy = False
-        try:
-            payload = self._api_server_status_payload(heartbeat_at=time.time())
-            active_runs = int(payload.get("active_runs") or 0)
-            status_state["activeRuns"] = active_runs
-            status_state["storedRuns"] = int(payload.get("stored_runs") or 0)
-            if isinstance(payload.get("metrics_today"), dict):
-                status_state["metricsToday"] = payload["metrics_today"]
-        except Exception:
-            logger.exception("GET /v1/widgets status-payload lookup failed")
-        try:
-            from gateway.status import derive_gateway_busy, parse_active_agents, read_runtime_status
-            runtime = read_runtime_status() or {}
-            gw_state = runtime.get("gateway_state")
-            gw_active = parse_active_agents(runtime.get("active_agents", 0))
-            status_state["activeAgents"] = gw_active
-            busy = bool(derive_gateway_busy(
-                gateway_running=True, gateway_state=gw_state, active_agents=gw_active))
-            status_state["gatewayBusy"] = busy
-        except Exception:
-            logger.exception("GET /v1/widgets runtime enrichment failed")
-            busy = active_runs > 0
-        try:
-            run_statuses = self._run_statuses.values()
-            # Recency-guard: a run record only counts toward a non-idle phase if
-            # it touched state within the live window. A record stuck in a
-            # non-terminal status (leaked running) ages out after
-            # _WIDGET_LIVE_TTL so the pill cannot be pinned to a phase forever.
-            now = time.time()
-            live = [
-                s for s in run_statuses
-                if now - float(s.get("updated_at", 0) or 0) <= self._WIDGET_LIVE_TTL
-            ]
-            if any(s.get("status") == "waiting_for_approval" for s in live):
-                status_state["phase"] = "awaiting_approval"
-            elif any(s.get("status") in {"error", "failed"} for s in live):
-                status_state["phase"] = "error"
-            elif any(s.get("status") in {"queued", "running", "waiting_for_approval", "stopping"} for s in live) or busy:
-                status_state["phase"] = "working"
-            else:
-                status_state["phase"] = "idle"
-        except Exception:
-            status_state["phase"] = "idle"
-        status_state["lastRun"] = self._widget_last_run()
-        status_widget = {
-            "id": "status", "kind": "status", "schemaVersion": 1,
-            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER), "state": status_state}
-        activity_widget = {
-            "id": "activity", "kind": "activity", "schemaVersion": 1,
-            "updatedAt": updated_at_ms, "rev": next(_WIDGETS_REV_COUNTER),
-            "state": {"events": self._widget_activity_events()}}
-        # AMBIENT PILLS SHELVED (Carlos 2026-10-14): approvals/spend/delegate
-        # widget kinds disabled at the source — they caused noise/errors on the
-        # Telegram side and weren't useful in the header. Kept, not deleted:
-        # the _widget_approval_items/_widget_spend_state/_widget_delegate_state
-        # helpers above remain defined for later refinement. Restore by
-        # un-commenting the three widget builders and putting them in the return.
-        return [status_widget, activity_widget]
-
-
-    def _widget_approval_items(self) -> list[dict[str, Any]]:
-        """Approval-waiting runs -> lightweight pill items, newest first.
-        Each carries just enough to render + deep-link; the full approval
-        payload stays on the run record and the SSE stream. Never raises."""
-        try:
-            now = time.time()
-            items: list[dict[str, Any]] = []
-            for s in self._run_statuses.values():
-                if s.get("status") != "waiting_for_approval":
-                    continue
-                if now - float(s.get("updated_at", 0) or 0) > self._WIDGET_LIVE_TTL:
-                    continue
-                appr = s.get("approval") or {}
-                if not isinstance(appr, dict):
-                    appr = {}
-                item: dict[str, Any] = {"runId": s.get("run_id") or s.get("runId") or "", "updatedAt": now}
-                for src_key, out_key in (("session_id", "sessionId"), ("tool_name", "tool"),
-                                         ("description", "description"), ("command", "command")):
-                    val = appr.get(src_key)
-                    if isinstance(val, str) and val.strip():
-                        item[out_key] = val.strip()
-                items.append(item)
-            items.sort(key=lambda it: float(it.get("updatedAt") or 0), reverse=True)
-            return items
-        except Exception:
-            return []
-
-    def _widget_spend_state(self) -> dict[str, Any]:
-        """Today's server-wide token/request tally plus an estimated USD cost.
-        Reuses the real in-memory daily metrics (metrics_today); cost is a
-        best-effort blended estimate (~$0.75/1M tokens) since the daily tally
-        does not track cost. Never raises."""
-        try:
-            m = self._api_server_status_payload().get("metrics_today") or {}
-            tokens = int(m.get("tokens") or 0)
-            state: dict[str, Any] = {
-                "day": m.get("day"),
-                "requests": int(m.get("requests") or 0),
-                "messages": int(m.get("messages") or 0),
-                "tokens": tokens,
-            }
-            # Prefer real per-run cost already tracked in run state (recent
-            # terminal runs); fall back to a clearly-labeled blended estimate
-            # (~$1.00/1M tokens) only when no run has cost data.
-            prc = 0.0
-            for s in self._run_statuses.values():
-                c = s.get("cost_usd")
-                if c is None:
-                    c = s.get("estimated_cost_usd")
-                if isinstance(c, (int, float)):
-                    prc += float(c)
-            state["estCostUsd"] = round(prc if prc > 0 else tokens * 1.0e-6, 4)
-            return state
-        except Exception:
-            return {"tokens": 0, "requests": 0, "messages": 0}
-
-    def _widget_delegate_state(self) -> dict[str, Any]:
-        """Kanban/delegateboard activity at a glance. Lazy-imports the board so
-        the widget rail stays decoupled; any absent/locked board or import
-        error degrades to a zero state rather than breaking /v1/widgets."""
-        empty = {"cards": {"ready": 0, "running": 0, "blocked": 0, "review": 0, "done": 0},
-                 "active": 0, "recent": []}
-        try:
-            from hermes_cli import kanban_db as kb
-            from hermes_cli import kanban_db_connect as kbc
-            status_keys = ("ready", "running", "blocked", "review", "done")
-            counts = {k: 0 for k in status_keys}
-            with kbc.connect_closing(board=None) as conn:
-                for k in status_keys:
-                    counts[k] = len(kb.list_tasks(conn, status=k, include_archived=False))
-            active = counts["running"] + counts["ready"] + counts["blocked"]
-            return {"cards": counts, "active": active, "recent": []}
-        except Exception:
-            return empty
-
-    def _widget_activity_events(self):
-        """Recent terminal runs -> humanized activity events, newest first."""
-        terminal = {"completed", "failed", "cancelled", "error"}
-        evs = []
-        for s in self._run_statuses.values():
-            if s.get("status") not in terminal:
-                continue
-            st = s.get("status")
-            label = "Run finished" if st == "completed" else (
-                "Run failed" if st == "failed" else ("Run cancelled" if st == "cancelled" else "Run hit an error"))
-            evs.append({"type": "run", "status": st, "text": label,
-                        "runId": s.get("run_id") or s.get("runId"),
-                        "finishedAt": int((s.get("finished_at") or s.get("updated_at") or 0) * 1000)})
-        evs.sort(key=lambda e: e["finishedAt"], reverse=True)
-        return evs[:6]
-
-    def _widget_last_run(self) -> Optional[dict[str, Any]]:
-        """Optional lastRun for the status widget: the most recent terminal structured run's
-        status/tokens (if present in existing run state), else None. Never raises."""
-        try:
-            terminal = {"completed", "failed", "error", "cancelled"}
-            candidates = [s for s in self._run_statuses.values()
-                          if s.get("status") in terminal]
-            if not candidates:
-                return None
-            latest = candidates[-1]
-            last: dict[str, Any] = {"status": latest.get("status")}
-            tokens = latest.get("usage") or latest.get("tokens")
-            if isinstance(tokens, dict):
-                if tokens.get("input_tokens") is not None:
-                    last["inputTokens"] = tokens["input_tokens"]
-                if tokens.get("output_tokens") is not None:
-                    last["outputTokens"] = tokens["output_tokens"]
-            if latest.get("finished_at") is not None:
-                last["finishedAt"] = latest["finished_at"]
-            return last
-        except Exception:
-            return None
 
     @_require_auth
     async def _handle_toolsets(self, request: web.Request) -> web.Response:
@@ -5474,7 +4819,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # -- /v1/runs, room grants, room dispatch: thin delegators (real methods: tests assert
     # __dict__ membership and patch the module-level implementations) ---------------------
 
-    _WIDGET_LIVE_TTL = 120  # seconds of recency a run needs to keep a non-idle pill phase
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
     _RUN_ORPHAN_STALL_TTL = 3600  # seconds of no run progress before a non-terminal run is reaped as orphaned
@@ -5611,9 +4955,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
-            # Registered LAST so every native mirror above wins: anything else under /p/<profile>/ is a
-            # secondary profile's inbound-port platform (Twilio, LINE, Teams, ...) served on this listener.
-            self._app.router.add_route("*", "/p/{profile}/{tail:.*}", self._handle_profile_ingress)
             # After native routes: Relay bootstrap shims feature-detect on this key and must
             # no-op rather than shadow the native session-control handlers.
             self._app["api_server_adapter"] = self
@@ -5639,6 +4980,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
             # Plugin-registered native handlers, wired before AppRunner.setup() freezes the router.
             self._wire_plugin_handlers(self._app)
+            # Registered LAST (after native routes AND plugin handlers, so their /p/<profile>/ mirrors win):
+            # anything else under /p/<profile>/ is a secondary profile's inbound-port platform (Twilio,
+            # LINE, Teams, ...) served on this listener.
+            self._app.router.add_route("*", "/p/{profile}/{tail:.*}", self._handle_profile_ingress)
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
 # Bind directly instead of probing 127.0.0.1 first — the old single-family pre-probe raced the
