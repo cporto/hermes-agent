@@ -4606,9 +4606,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         from tools.approval_context import set_current_session_key
                         approval_token = set_current_session_key(approval_session_key)
                         register_gateway_notify(approval_session_key, approval_notify_callback)
-                        # Session grants outlive the run: key them by the chat session, not run_id.
-                        from tools.approval import set_grant_alias
-                        set_grant_alias(approval_session_key, gateway_session_key or session_id or "")
                     optin_token = None
                     if request_interactive_approval:
                         from tools.approval_context import set_api_interactive_approval
@@ -4625,9 +4622,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         if approval_token is not None:
                             from tools.approval_context import reset_current_session_key
                             _api_runs._unregister_approval_notify(approval_session_key)
-                            with suppress(Exception):
-                                from tools.approval import clear_grant_alias
-                                clear_grant_alias(approval_session_key)
                             with suppress(Exception):
                                 reset_current_session_key(approval_token)
                     # S3 Continue=Resume (write side): now that run_conversation has returned, the
