@@ -451,22 +451,6 @@ def _sync_permanent_from_disk(approved: set, key: str) -> None:
     _permanent_baseline_by_home[key] = on_disk
 
 
-_grant_aliases: dict[str, str] = {}  # park key (api_server run_id) -> stable chat-session key
-
-
-def set_grant_alias(park_key: str, grant_key: str) -> None:
-    """Store/look up session grants for *park_key* under *grant_key* (carried patch: an api_server run parks its
-    approvals under a per-turn run_id, so "allow for this session" never matched the next turn)."""
-    if park_key and grant_key and park_key != grant_key:
-        with _lock:
-            _grant_aliases[park_key] = grant_key
-
-
-def clear_grant_alias(park_key: str) -> None:
-    with _lock:
-        _grant_aliases.pop(park_key, None)
-
-
 def _session_grant_key(session_key: str) -> str | tuple[str, str]:
     """A parent's session grant cannot authorize a child running as another profile (any route, room or not).
 
@@ -474,7 +458,6 @@ def _session_grant_key(session_key: str) -> str | tuple[str, str]:
     home/credentials; approvals in that child are keyed by both the session and home.
     The mark is scoped by delegated_profile_scope and survives nested child routes.
     """
-    session_key = _grant_aliases.get(session_key, session_key)
     from gateway.hosted_room_execution_policy import profile_routed
     if not profile_routed():
         return session_key
