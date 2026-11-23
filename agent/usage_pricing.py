@@ -25,7 +25,6 @@ _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _MODELS_DEV_DIRECT_HOSTS = {
     "openai": "openai.com", "xai": "x.ai", "anthropic": "anthropic.com", "google": "googleapis.com",
     "deepseek": "deepseek.com", "xiaomi": "xiaomimimo.com",
-    "fireworks": "api.fireworks.ai",
 }
 
 # Below $0.01, render at 4 dp so cheap-model costs never display as $0.00.
@@ -630,30 +629,9 @@ def _models_dev_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
             return None
     from agent.models_dev import get_model_info
 
-    def lookup(model_id: str) -> PricingEntry | None:
-        model_info = get_model_info(route.provider, model_id)
-        if model_info is None or not model_info.has_cost_data():
-            return None
-        return PricingEntry(
-            input_cost_per_million=_to_decimal(model_info.cost_input),
-            output_cost_per_million=_to_decimal(model_info.cost_output),
-            cache_read_cost_per_million=_to_decimal(model_info.cost_cache_read),
-            cache_write_cost_per_million=_to_decimal(model_info.cost_cache_write),
-            source="provider_models_api", source_url="https://models.dev", pricing_version="models.dev",
-            fetched_at=_UTC_NOW(),
-        )
-
-    if route.provider == "fireworks":
-        for candidate in (
-            route.model,
-            "accounts/fireworks/models/" + route.model,
-            "accounts/fireworks/routers/" + route.model,
-        ):
-            entry = lookup(candidate)
-            if entry:
-                return entry
+    model_info = get_model_info(route.provider, route.model)
+    if model_info is None or not model_info.has_cost_data():
         return None
-    return lookup(route.model)
     return PricingEntry(
         input_cost_per_million=_to_decimal(model_info.cost_input),
         output_cost_per_million=_to_decimal(model_info.cost_output),
