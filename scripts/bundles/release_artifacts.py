@@ -7,6 +7,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path, PureWindowsPath
 from typing import Iterable
+from urllib.parse import unquote
 
 from scripts.releases import lanes as lane_set
 from scripts.releases.stable import read_admitted_candidate, accepted_smoke_results, validate_candidates
@@ -36,8 +38,10 @@ def release_channel(tag: str) -> str:
 
     The tag decides, never a caller flag, so a stable candidate can never write a canary feed or
     the reverse (scripts/termux/deb_version.py and scripts/releases/r2.py key on it the same way)."""
-    from hermes_cli.update_channel import is_canary_tag
+    from hermes_cli.update_channel import is_canary_tag, is_commit_tag
 
+    if is_commit_tag(tag):
+        raise ValueError(f"Commit builds publish to no release channel: {tag!r}")
     return "canary" if is_canary_tag(tag) else "stable"
 
 
@@ -46,7 +50,8 @@ def sha256_file(file: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def stamp_matches(stamp: dict, tag: str, commit: str, *, channel_request: dict | None = None) -> None:
+def stamp_matches(stamp: dict, tag: str, commit: str, *, channel_request: dict | None = None,
+                  legacy_commit_build: bool = False) -> None:
     if channel_request is not None and channel_request.get("receiverCandidate"):
         if (stamp.get("channelBuild") is not None or stamp.get("source") != "build"
                 or stamp.get("receiverProtocol") != 1 or stamp.get("displayVersion") != channel_request["version"]
@@ -59,9 +64,21 @@ def stamp_matches(stamp: dict, tag: str, commit: str, *, channel_request: dict |
                 or stamp.get("commit") != channel_request["commit"] or stamp.get("tag")):
             raise ValueError("Built package provenance does not match the channel request")
         return
+    from hermes_cli.update_channel import is_commit_tag, tag_core
+
+    if legacy_commit_build:
+        if not is_commit_tag(tag):
+            raise ValueError("Legacy commit build mode is only allowed for commit claims")
+        if (stamp.get("source") != "commit-build" or stamp.get("commit") != commit
+                or stamp.get("tag") is not None or stamp.get("baseVersion") != tag_core(tag)):
+            raise ValueError("Built legacy commit package provenance does not match the claim")
+        return
     if (stamp.get("commit") != commit or stamp.get("tag") != tag
             or stamp.get("baseVersion") != release_version(tag)):
         raise ValueError("Built package provenance does not match the release")
+    # A commit build's packages refuse every update (source commit-build); a release's never do.
+    if (stamp.get("source") == "commit-build") != is_commit_tag(tag):
+        raise ValueError("Built package update ownership does not match the release kind")
 
 
 def single(items):
@@ -108,44 +125,116 @@ def require_squirrel_downloadable(package: Path) -> None:
     print(f"macOS update ZIP: {size:,} bytes, {(SQUIRREL_ZIP_LIMIT - size) / 1e6:.0f} MB under the 1 GiB limit")
 
 
+def _probe_windows_product_version(executable: Path) -> str:
+    # -Command joins trailing argv into the script text, so $args stays empty.
+    return subprocess.check_output([
+        "powershell", "-NoProfile", "-Command",
+        "(Get-Item -LiteralPath $env:RECORD_EXECUTABLE).VersionInfo.ProductVersion",
+    ], env={**os.environ, "RECORD_EXECUTABLE": str(executable)},
+        text=True, encoding="utf-8", stdin=subprocess.DEVNULL, timeout=30).strip()
+
+
+def _packaged_windows_executable_version(
+    archive: zipfile.ZipFile,
+    executable_relpath: str,
+    *,
+    probe=None,
+) -> str:
+    """Extract the manifest's declared executable from the MSIX itself and probe its version.
+
+    Reading ``*-unpacked/`` on disk is unsafe when a later variant build (such as the
+    Store build on a canary) overwrites the unpacked directory with a different quad.
+    """
+    if not executable_relpath:
+        raise ValueError("MSIX application manifest has no Executable attribute")
+    target = PureWindowsPath(executable_relpath).as_posix().lstrip("/")
+    # MakeAppx percent-encodes part names: "Hermes Agent.exe" is stored as Hermes%20Agent.exe.
+    entry = single(
+        name for name in archive.namelist()
+        if unquote(name.replace("\\", "/")).lstrip("/").casefold() == target.casefold()
+    )
+    probe = probe or _probe_windows_product_version
+    with tempfile.TemporaryDirectory() as temp:
+        extracted = Path(temp) / PureWindowsPath(entry).name
+        with archive.open(entry) as src, extracted.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+        return probe(extracted)
+
+
+def _record_termux(root: Path, tag: str, commit: str, *, legacy_commit_build: bool) -> dict:
+    from hermes_cli.update_channel import is_commit_tag, tag_core
+
+    package = single((root / "deb").glob("*.deb"))
+    fields = subprocess.check_output(
+        ["dpkg-deb", "--field", str(package), "Package", "Version", "Architecture"],
+        text=True, encoding="utf-8", timeout=60,
+    )
+    parsed = dict(line.split(": ", 1) for line in fields.splitlines())
+    # A legacy claim builds through the tagless --commit path, which versions X.Y.Z+commit<sha12>.
+    expected_version = (f"{tag_core(tag)}+commit{commit[:12]}" if legacy_commit_build
+                        else deb_version_for_tag(tag))
+    if parsed["Version"] != expected_version:
+        raise ValueError("Termux artifact version differs from release tag")
+    if parsed["Architecture"] != "aarch64":
+        raise ValueError("Wrong Termux package architecture")
+    expected_tag = None if legacy_commit_build else tag
+    with tempfile.TemporaryDirectory() as temp:
+        subprocess.run(["dpkg-deb", "--extract", str(package), temp], check=True, timeout=60)
+        stamps = list(Path(temp).rglob("install-stamp.json"))
+        if not any((data := json.loads(p.read_text(encoding="utf-8-sig"))).get("commit") == commit
+                   and data.get("tag") == expected_tag
+                   and (data.get("source") == "commit-build") == is_commit_tag(tag)
+                   for p in stamps):
+            raise ValueError("Termux package has no matching provenance")
+    return {"identity": parsed["Package"], "version": parsed["Version"],
+            "filename": package.relative_to(root).as_posix()}
+
+
 def record(platform: str, arch: str, root: Path, tag: str, commit: str, out: Path,
-           *, channel_request: dict | None = None) -> None:
+           *, channel_request: dict | None = None, executable_version_probe=None,
+           legacy_commit_build: bool = False) -> None:
     """Read identities from the built packages, never from the workflow matrix."""
+    from hermes_cli.update_channel import is_commit_tag, tag_core
+
+    if legacy_commit_build and (channel_request is not None or not is_commit_tag(tag)):
+        raise ValueError("Legacy commit build mode is only allowed for commit claims")
     row: dict = {"platform": platform, "arch": arch, "tag": tag, "commit": commit}
+    expected_version = tag_core(tag) if legacy_commit_build else None
     if platform == "windows":
         package = single(p for p in root.glob(f"*-win-{arch}.msix") if not p.name.startswith("Store-"))
-        if channel_request is None and not package.name.endswith(f"-{release_version(tag)}-win-{arch}.msix"):
-            raise ValueError("Windows artifact filename differs from release tag")
+        if channel_request is None:
+            expected_file_version = expected_version if legacy_commit_build else release_version(tag)
+            if not package.name.endswith(f"-{expected_file_version}-win-{arch}.msix"):
+                raise ValueError("Windows artifact filename differs from release tag")
+        version_sidecar = root / f"version-info-{arch}.json"
         with zipfile.ZipFile(package) as archive:
             manifest = ET.fromstring(archive.read("AppxManifest.xml"))
             identity = manifest.find("{*}Identity")
             application = desktop_application(manifest, channel_request)
             stamp_name = single(n for n in archive.namelist() if n.replace("\\", "/").endswith("/resources/install-stamp.json"))
             stamp = json.loads(archive.read(stamp_name))
-            stamp_matches(stamp, tag, commit, channel_request=channel_request)
-        if identity.attrib["ProcessorArchitecture"].lower() != arch:
-            raise ValueError("MSIX architecture differs from release target")
-        row.update(identity=identity.attrib["Name"], publisher=identity.attrib["Publisher"],
-                   applicationId=application.attrib["Id"], version=identity.attrib["Version"])
-        version_sidecar = root / f"version-info-{arch}.json"
-        if version_sidecar.is_file():
-            row["executableVersion"] = json.loads(
-                version_sidecar.read_text(encoding="utf-8-sig"),
-            )["productVersion"]
-        elif os.name == "nt":
-            # The stamp carries no executable name; the package's own manifest does.
-            executable_name = PureWindowsPath(application.attrib["Executable"]).name
-            executable = single(root.glob(f"*-unpacked/{executable_name}"))
-            # -Command joins trailing argv into the script text, so $args stays empty.
-            row["executableVersion"] = subprocess.check_output([
-                "powershell", "-NoProfile", "-Command",
-                "(Get-Item -LiteralPath $env:RECORD_EXECUTABLE).VersionInfo.ProductVersion",
-            ], env={**os.environ, "RECORD_EXECUTABLE": str(executable)},
-                text=True, encoding="utf-8", stdin=subprocess.DEVNULL).strip()
+            stamp_matches(stamp, tag, commit, channel_request=channel_request,
+                          legacy_commit_build=legacy_commit_build)
+            if identity.attrib["ProcessorArchitecture"].lower() != arch:
+                raise ValueError("MSIX architecture differs from release target")
+            row.update(identity=identity.attrib["Name"], publisher=identity.attrib["Publisher"],
+                       applicationId=application.attrib["Id"], version=identity.attrib["Version"])
+            if version_sidecar.is_file():
+                row["executableVersion"] = json.loads(
+                    version_sidecar.read_text(encoding="utf-8-sig"),
+                )["productVersion"]
+            elif executable_version_probe is not None or os.name == "nt":
+                # The stamp carries no executable name; the package's own manifest does.
+                row["executableVersion"] = _packaged_windows_executable_version(
+                    archive,
+                    application.attrib.get("Executable", ""),
+                    probe=executable_version_probe,
+                )
         if stamp.get("receiverProtocol") == 1:
             row["receiverProtocol"] = 1
     elif platform == "macos":
-        version = channel_request["version"] if channel_request is not None else release_version(tag)
+        version = (channel_request["version"] if channel_request is not None
+                   else expected_version if legacy_commit_build else release_version(tag))
         package = single(root.glob(f"*-mac-{arch}.zip"))
         if not package.name.endswith(f"-{version}-mac-{arch}.zip"):
             raise ValueError("macOS artifact filename differs from requested version")
@@ -160,28 +249,19 @@ def record(platform: str, arch: str, root: Path, tag: str, commit: str, out: Pat
             require_owner_write(archive)
             info = plistlib.loads(archive.read(single(n for n in archive.namelist() if re.fullmatch(r"[^/]+\.app/Contents/Info.plist", n))))
             stamp = json.loads(archive.read(single(n for n in archive.namelist() if re.fullmatch(r"[^/]+\.app/Contents/Resources/install-stamp.json", n))))
-        stamp_matches(stamp, tag, commit, channel_request=channel_request)
+        stamp_matches(stamp, tag, commit, channel_request=channel_request,
+                      legacy_commit_build=legacy_commit_build)
         if stamp.get("receiverProtocol") == 1:
             row["receiverProtocol"] = 1
         row.update(identity=info["CFBundleIdentifier"], teamId=team.group(1), version=info["CFBundleShortVersionString"], filename=package.name)
         if row["version"] != version:
             raise ValueError("App version differs from requested version")
     elif platform == "termux":
-        package = single((root / "deb").glob("*.deb"))
-        fields = subprocess.check_output(["dpkg-deb", "--field", str(package), "Package", "Version", "Architecture"], text=True, encoding="utf-8")
-        parsed = dict(line.split(": ", 1) for line in fields.splitlines())
-        row.update(identity=parsed["Package"], version=parsed["Version"], filename=package.relative_to(root).as_posix())
-        if parsed["Version"] != deb_version_for_tag(tag):
-            raise ValueError("Termux artifact version differs from release tag")
-        if parsed["Architecture"] != "aarch64":
-            raise ValueError("Wrong Termux package architecture")
-        with tempfile.TemporaryDirectory() as temp:
-            subprocess.run(["dpkg-deb", "--extract", str(package), temp], check=True)
-            stamps = list(Path(temp).rglob("install-stamp.json"))
-            if not any((data := json.loads(p.read_text(encoding="utf-8-sig"))).get("commit") == commit and data.get("tag") == tag for p in stamps):
-                raise ValueError("Termux package has no matching provenance")
+        row.update(_record_termux(root, tag, commit, legacy_commit_build=legacy_commit_build))
     else:
         raise ValueError("Unknown platform")
+    if legacy_commit_build:
+        row["legacyCommitBuild"] = True
     if channel_request is not None:
         expected = channel_request["identity"]["msixAppIdWithOrg" if platform == "windows" else "appId"]
         version = channel_request["windowsVersion" if platform == "windows" else "version"]
@@ -478,6 +558,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--commit", default=os.environ.get("RELEASE_COMMIT") or os.environ.get("GITHUB_SHA"))
     parser.add_argument("--public-base", default=os.environ.get("CLOUDFLARE_R2_PUBLIC_URL"))
     parser.add_argument("--store-only", action="store_true")
+    parser.add_argument("--legacy-commit-build", action="store_true",
+                        help="Record a commit claim built on a pre-claim commit (tagless X.Y.Z provenance)")
     for name in ("identity", "publisher", "version", "self-uri", "artifact-uri"):
         parser.add_argument(f"--{name}")
     parser.add_argument("--variant", choices=["bundled", "light"])
@@ -499,7 +581,8 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "record":
         request = json.loads(args.channel_request.read_text(encoding="utf-8-sig")) if args.channel_request else None
-        record(args.platform, args.arch, args.root, args.tag, args.commit, args.out, channel_request=request)
+        record(args.platform, args.arch, args.root, args.tag, args.commit, args.out,
+               channel_request=request, legacy_commit_build=args.legacy_commit_build)
     else:
         if not args.archive:
             parser.error(f"{args.command} requires the admitted --archive ref")

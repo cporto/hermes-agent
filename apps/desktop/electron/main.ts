@@ -219,7 +219,7 @@ import { liveWindowState, overlayWindowState } from './connection-window-state'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { resolveDesktopUserData } from './data-paths'
-import { registerDeepLinkProtocol as registerDeepLinkProtocolWith } from './deep-link-protocol'
+import { extractDeepLink, handleLaunchDeepLink, registerDeepLinkProtocol as registerDeepLinkProtocolWith } from './deep-link-protocol'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine, formatLogStamp } from './desktop-log-line'
 import {
@@ -13246,6 +13246,7 @@ function createWindow() {
 
   const revealController = wireWindowReveal(createdMainWindow, {
     onRevealed: () => {
+      revealedMainWindows.add(createdMainWindow)
       // Persist geometry as soon as the window is visible so a crash before the
       // first clean resize/move/close still captures the restored bounds (#56726).
       schedulePersistWindowState()
@@ -17172,17 +17173,16 @@ let _rendererReadyForDeepLink = false
 // Set by sendOpenUpdatesRequested() when the renderer cannot hear it yet.
 let _pendingOpenUpdates = false
 
-function _extractDeepLink(argv) {
-  if (!Array.isArray(argv)) {
-    return null
-  }
-
-  return argv.find(a => typeof a === 'string' && DEEPLINK_SCHEMES.some(s => a.startsWith(`${s}://`))) || null
-}
+const revealedMainWindows = new WeakSet()
+const launchTarget = () => ({ ready: revealedMainWindows.has(mainWindow), activate: () => activateWindow(mainWindow) })
 
 function handleDeepLink(url) {
   if (!url || typeof url !== 'string') {
     return
+  }
+
+  if (handleLaunchDeepLink(url, DEEPLINK_SCHEMES, launchTarget())) {
+    return rememberLog('[deeplink] launch link handled (content ignored)')
   }
 
   let parsed
@@ -17343,7 +17343,7 @@ if (!isPrimaryInstance) {
       handleDeepLink('hermes://close-preview')
     }
 
-    const url = _extractDeepLink(argv)
+    const url = extractDeepLink(argv, DEEPLINK_SCHEMES)
 
     if (url) {
       handleDeepLink(url)
@@ -17514,7 +17514,7 @@ app.whenReady().then(() => {
   })
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
-  const _coldStartLink = _extractDeepLink(process.argv)
+  const _coldStartLink = extractDeepLink(process.argv, DEEPLINK_SCHEMES)
 
   if (_coldStartLink) {
     handleDeepLink(_coldStartLink)
